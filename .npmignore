@@ -1,0 +1,10 @@
+# Source files
+src/
+tsconfig.json
+
+# Development files
+*.log
+.DS_Store
+node_modules/
+
+# Only publish the built files in dist/
