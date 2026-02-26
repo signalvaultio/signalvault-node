@@ -1,5 +1,5 @@
 {
-  "name": "@signalvaultio/signalvault-node",
+  "name": "@signalvaultio/node",
   "version": "0.1.0",
   "description": "SignalVault SDK - AI audit logs and guardrails for safe production AI",
   "main": "dist/index.js",

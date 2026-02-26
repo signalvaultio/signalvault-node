@@ -1,17 +1,17 @@
-# @signalvaultio/signalvault-node
+# @signalvaultio/node
 
 AI audit logs and guardrails for your OpenAI applications.
 
 ## Installation
 
 ```bash
-npm install @signalvaultio/signalvault-node openai
+npm install @signalvaultio/node openai
 ```
 
 ## Quick Start
 
 ```typescript
-import SignalVaultClient from '@signalvaultio/signalvault-node';
+import SignalVaultClient from '@signalvaultio/node';
 
 const client = new SignalVaultClient({
   apiKey: 'sk_live_your_signalvault_key',    // Your SignalVault API key
