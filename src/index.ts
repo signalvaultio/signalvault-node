@@ -1,5 +1,40 @@
 import OpenAI from 'openai';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  ToolRecordOptions,
+  ToolsAPI,
+  runWithContext,
+  sanitizeError,
+  sanitizePayload,
+  validateToolName,
+  wrapTool,
+} from './tools';
+
+export type { ToolRecordOptions, ToolsAPI } from './tools';
+
+// ---------------------------------------------------------------------------
+// Environment guard
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard-fails if the SDK is loaded in a browser context. The SDK relies on
+ * `async_hooks` (Node-only) and is intended for server-side use; bundling it
+ * for the browser would expose `apiKey`, `openaiApiKey`, and `anthropicApiKey`
+ * to end users — which is exactly the kind of leak this product is meant to
+ * prevent.
+ */
+function assertNodeEnvironment(): void {
+  // `process` exists on Node and not in plain browsers. `window` is the
+  // canonical browser global. We refuse to run if we look browser-like.
+  const hasProcess = typeof process !== 'undefined' && process?.versions?.node;
+  const hasWindow = typeof (globalThis as { window?: unknown }).window !== 'undefined';
+  if (!hasProcess || hasWindow) {
+    throw new Error(
+      '[SignalVault] This SDK is server-side only. Do not bundle it for browser use — ' +
+        'it will leak your API keys to end users. Call SignalVault from your backend instead.'
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -95,6 +130,8 @@ export class SignalVaultClient {
   private readonly anthropic: any | null;
 
   constructor(config: SignalVaultConfig) {
+    assertNodeEnvironment();
+
     if (!config.openaiApiKey && !config.anthropicApiKey) {
       throw new Error('[SignalVault] At least one of openaiApiKey or anthropicApiKey is required.');
     }
@@ -125,6 +162,146 @@ export class SignalVaultClient {
       }
     } else {
       this.anthropic = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Agent tool-use capture
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Wraps a function so every call records an `agent.tool_call` event with
+   * timing, input, output, and any error. The wrapper auto-times, runs the
+   * inner function, fires the audit event in the background, and returns the
+   * inner result (or rethrows the inner error).
+   *
+   * Tool calls invoked inside a `withContext({ requestId })` block auto-pick
+   * up the requestId for correlation with the parent ai.request.
+   *
+   * @example
+   * ```typescript
+   * const fetchWeather = signalvault.tool('fetch_weather', async (city: string) => {
+   *   const res = await fetch(`https://api.example.com/weather?city=${city}`);
+   *   return res.json();
+   * });
+   *
+   * const weather = await fetchWeather('London');
+   * ```
+   */
+  tool<TArgs extends readonly unknown[], TReturn>(
+    name: string,
+    fn: (...args: TArgs) => TReturn | Promise<TReturn>,
+    options?: { metadata?: Record<string, unknown> }
+  ): (...args: TArgs) => Promise<TReturn> {
+    return wrapTool(
+      {
+        recordFn: (opts) => this.sendToolCallEvent(opts),
+        debug: this.debugMode,
+      },
+      name,
+      fn,
+      options
+    );
+  }
+
+  /**
+   * Manual tool recording API. Use when the wrapper isn't a fit (streaming
+   * tools, custom timing, post-hoc capture from logs).
+   *
+   * @example
+   * ```typescript
+   * await signalvault.tools.record({
+   *   toolName: 'fetch_weather',
+   *   toolInput: { city: 'London' },
+   *   toolOutput: { temp: 12.3 },
+   *   durationMs: 142,
+   * });
+   * ```
+   */
+  get tools(): ToolsAPI {
+    return {
+      record: (opts) => this.sendToolCallEvent(opts),
+    };
+  }
+
+  /**
+   * Runs the given async function inside a context where tool calls are
+   * automatically correlated to the provided `requestId`. Useful for grouping
+   * a multi-step agent loop under one logical turn.
+   *
+   * @example
+   * ```typescript
+   * await signalvault.withContext({ requestId: 'agent-turn-abc' }, async () => {
+   *   const llm = await signalvault.chat.completions.create({...});
+   *   await fetchWeather('London'); // tool call auto-linked to 'agent-turn-abc'
+   * });
+   * ```
+   */
+  withContext<T>(ctx: { requestId?: string }, fn: () => Promise<T>): Promise<T> {
+    return runWithContext(ctx, fn);
+  }
+
+  private async sendToolCallEvent(opts: ToolRecordOptions): Promise<void> {
+    const metadata = { ...this.defaultMetadata, ...(opts.metadata ?? {}) };
+
+    // Validate + sanitize before constructing the body. validateToolName throws
+    // on missing/empty name; surfacing that to the caller is intentional —
+    // the manual API should refuse malformed input rather than silently fail.
+    const safeName = validateToolName(opts.toolName);
+
+    const payload: Record<string, unknown> = {
+      tool_name: safeName,
+      tool_input: sanitizePayload(opts.toolInput),
+      tool_output: sanitizePayload(opts.toolOutput),
+      duration_ms: opts.durationMs,
+    };
+    const safeError = sanitizeError(opts.error);
+    if (safeError !== undefined) payload.error = safeError;
+    if (opts.startedAt) payload.started_at = opts.startedAt;
+
+    const body: Record<string, unknown> = {
+      type: 'agent.tool_call',
+      environment: this.svEnvironment,
+      metadata,
+      payload,
+    };
+    if (opts.requestId) body.request_id = opts.requestId;
+
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(body);
+    } catch (error) {
+      // sanitizePayload should make this impossible, but guard the outer
+      // serialize too — we'd rather drop the audit than crash the app.
+      console.warn('[SignalVault] tool_call serialization failed, event dropped:', error);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${this.svBaseUrl}/v1/events`, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(this.bgTimeout),
+        body: serialized,
+      });
+
+      // Surface 4xx unconditionally — those are usually misconfigurations
+      // (bad key, malformed payload) the user must know about. 5xx are noisy
+      // and only logged in debug mode.
+      if (!response.ok) {
+        if (response.status >= 400 && response.status < 500) {
+          console.warn(
+            `[SignalVault] tool_call rejected with ${response.status}. ` +
+              `Check your apiKey and event payload.`
+          );
+        } else if (this.debugMode) {
+          console.error('[SignalVault] tool_call event failed:', response.status);
+        }
+      }
+    } catch (error) {
+      if (this.debugMode) {
+        console.error('[SignalVault] tool_call event error:', error);
+      }
     }
   }
 

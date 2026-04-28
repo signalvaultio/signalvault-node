@@ -2,6 +2,11 @@
 
 AI audit logs and guardrails for your OpenAI and Anthropic applications.
 
+> **Server-side only.** This SDK uses Node APIs (`async_hooks`, `fetch`) and
+> requires Node.js **18+**. Do **not** bundle it for the browser — your
+> `apiKey`, `openaiApiKey`, and `anthropicApiKey` would be exposed to end
+> users. Always call SignalVault from your backend.
+
 ## Installation
 
 ```bash
@@ -85,6 +90,69 @@ for await (const event of stream) {
   }
 }
 ```
+
+## Agent Tool-Use Capture
+
+Log every tool invocation made by your agents — name, input, output, duration, and any error — as auditable events alongside your LLM calls.
+
+### Wrapper API (recommended)
+
+```typescript
+const fetchWeather = client.tool('fetch_weather', async (city: string) => {
+  const res = await fetch(`https://api.example.com/weather?city=${city}`);
+  return res.json();
+});
+
+// Call it like the original — SignalVault auto-times and audits
+const weather = await fetchWeather('London');
+```
+
+The wrapper records the call asynchronously (no impact on your tool's latency) and passes the result through unchanged. Errors are recorded and rethrown.
+
+### Manual API
+
+```typescript
+await client.tools.record({
+  toolName: 'fetch_weather',
+  toolInput: { city: 'London' },
+  toolOutput: { temp: 12.3 },
+  durationMs: 142,
+});
+```
+
+### What gets captured (and what to keep out)
+
+When you wrap a tool or call `tools.record()`, SignalVault captures:
+
+- `tool_name` (truncated to 200 bytes)
+- `tool_input` — the function arguments, JSON-serialized (capped at 256 KB; oversize values are truncated with a marker)
+- `tool_output` — the function return value, JSON-serialized (same 256 KB cap)
+- `error.message` if the tool throws (truncated to 1900 bytes)
+- `duration_ms`, `started_at`, and any `metadata` you attach
+
+These fields are stored encrypted at rest server-side, but they go on the wire
+to SignalVault's API. **If you pass user PII, secrets, or API keys as tool
+arguments, those values will leave your process and be stored in SignalVault.**
+Recommendations:
+
+- Sanitize sensitive arguments before invoking the wrapped tool, or use the
+  manual `tools.record()` API and pass a redacted copy.
+- Don't put secrets in error messages — they end up in `error` verbatim.
+- Use `metadata` for non-sensitive identifiers (`user_id`, `feature`,
+  `workspace_id`); avoid putting raw user content in metadata.
+
+### Linking tool calls to a parent LLM turn
+
+Wrap your agent loop in `withContext` and tool calls inside auto-correlate to the given `requestId`:
+
+```typescript
+await client.withContext({ requestId: 'agent-turn-abc' }, async () => {
+  const llmResponse = await client.chat.completions.create({...});
+  await fetchWeather('London'); // auto-linked to 'agent-turn-abc'
+});
+```
+
+Without `withContext`, tool calls are recorded as orphans (no parent request).
 
 ## Metadata
 

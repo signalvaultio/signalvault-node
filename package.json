@@ -1,6 +1,6 @@
 {
   "name": "@signalvaultio/node",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SignalVault SDK - AI audit logs and guardrails for safe production AI",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -27,6 +27,9 @@
   ],
   "author": "SignalVault <support@signalvault.io>",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/signalvaultio/signalvault-node.git"
