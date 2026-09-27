@@ -1,8 +1,11 @@
 name: Release
 
-# Publishes to npm via trusted publishing (OIDC) when a vX.Y.Z tag is pushed.
+# Stages a release on npm via trusted publishing (OIDC) when a vX.Y.Z tag is pushed.
 # No npm token is stored anywhere; npm trusts this workflow file in this repo.
-# The `release` environment requires manual approval before the job runs.
+# The `release` environment requires manual approval before the job runs, and
+# the trusted publisher is stage-only: the version goes live only after a
+# maintainer approves it with 2FA (npmjs.com → Staged Packages, or
+# `npm stage approve <stage-id>`).
 
 on:
   push:
@@ -27,8 +30,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs npm >= 11.5.1.
-      - run: npm install -g npm@^11.5.1
+      # Staged publishing needs npm >= 11.15.0 (and Node >= 22.14).
+      - run: npm install -g npm@^11.15.0
 
       - name: Check tag matches package.json version
         run: |
@@ -44,4 +47,4 @@ jobs:
       - run: npm run build
       - run: npm pack --dry-run
 
-      - run: npm publish --access public
+      - run: npm stage publish --access public --provenance
