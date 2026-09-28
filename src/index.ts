@@ -151,7 +151,7 @@ export class SignalVaultBlockedError extends Error {
   readonly dashboardUrl?: string;
 
   constructor(requestId: string, violations: SignalVaultViolation[], dashboardUrl?: string) {
-    const types = [...new Set(violations.map((v) => v.type))].join(', ') || 'policy';
+    const types = [...new Set(violations.map((v) => String(v?.type ?? '')).filter(Boolean))].join(', ') || 'policy';
     super(`[SignalVault] Request blocked by guardrails (${types}).`);
     this.name = 'SignalVaultBlockedError';
     this.requestId = requestId;
@@ -174,12 +174,42 @@ export class SignalVaultUnavailableError extends Error {
 }
 
 const ALLOW: SignalVaultDecision = { decision: 'allow', violations: [], redactions: [] };
+/**
+ * Set on the decision returned when no pre-flight decision was obtained.
+ * 'record': the server may not have stored the request (network, timeout,
+ * 5xx, invalid response), so it is recorded in the background and the
+ * unchecked call still appears in the audit log. 'skip': the server refused
+ * it (401/402/403/429/3xx), so a response event would be refused too.
+ */
+const PREFLIGHT_FAILED = Symbol('preflightFailed');
+/** Causes where re-sending the ai.request later can succeed. */
+const RECORDABLE_CAUSES = new Set(['timeout', 'network', '5xx', 'invalid-response']);
 const DECISIONS = new Set(['allow', 'warn', 'block', 'redact']);
 
 interface PostResult {
   ok: boolean;
   status: number;
   response?: Response;
+}
+
+interface BackgroundOptions {
+  /**
+   * Add an event_id idempotency key. Off only for the fallback ai.request,
+   * which relies on the server's request_id de-duplication instead: the
+   * original pre-flight may have been stored before the client gave up.
+   */
+  eventId?: boolean;
+  /** Retry once on transient failures. Off for the manual tools.record() API. */
+  retry?: boolean;
+}
+
+/**
+ * Checks the name rather than `instanceof Error`: fetch rejects with a
+ * DOMException, which fails `instanceof` across realms (e.g. under Jest).
+ */
+function isTimeout(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || name === 'AbortError';
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +439,7 @@ export class SignalVaultClient {
    */
   get tools(): ToolsAPI {
     return {
-      record: (opts) => this.sendToolCallEvent(opts),
+      record: (opts) => this.sendToolCallEvent(opts, false),
     };
   }
 
@@ -430,7 +460,7 @@ export class SignalVaultClient {
     return runWithContext(ctx, fn);
   }
 
-  private async sendToolCallEvent(opts: ToolRecordOptions): Promise<void> {
+  private async sendToolCallEvent(opts: ToolRecordOptions, retry = true): Promise<void> {
     const metadata = { ...this.defaultMetadata, ...(opts.metadata ?? {}) };
 
     // Validate + sanitize before the first await, so the payload reflects the
@@ -466,7 +496,7 @@ export class SignalVaultClient {
       return;
     }
 
-    const result = await this.postBackground(body);
+    const result = await this.postBackground(body, { retry });
     if (result && !result.ok && result.status >= 400 && result.status < 500 && result.status !== 429) {
       // Surface 4xx unconditionally — those are usually misconfigurations
       // (bad key, malformed payload) the user must know about.
@@ -603,14 +633,16 @@ export class SignalVaultClient {
     metadata: Record<string, unknown>
   ) {
     const model = params.model as string;
-    await this.enforce(requestId, model, params.messages as unknown[], metadata, 'openai');
+    const messages = params.messages as unknown[];
+    const decision = await this.enforce(requestId, model, messages, metadata, 'openai');
+    const fallback = this.fallbackRequest(decision, requestId, model, messages, metadata, 'openai');
 
     const response = await this.openai!.chat.completions.create(params as any);
 
     if (params.stream) {
       return this.wrapStream(response as any, (output, promptTokens, completionTokens) =>
         this.sendResponseEvent(
-          requestId, model, output, promptTokens, completionTokens, metadata, 'openai'
+          requestId, model, output, promptTokens, completionTokens, metadata, 'openai', fallback
         )
       );
     }
@@ -623,7 +655,7 @@ export class SignalVaultClient {
         completion.choices[0]?.message?.content || '',
         completion.usage?.prompt_tokens || 0,
         completion.usage?.completion_tokens || 0,
-        metadata, 'openai'
+        metadata, 'openai', fallback
       )
     );
     return completion;
@@ -669,14 +701,16 @@ export class SignalVaultClient {
     params: any,
     metadata: Record<string, unknown>
   ) {
-    await this.enforce(requestId, params.model, anthropicMessagesForAudit(params), metadata, 'anthropic');
+    const messages = anthropicMessagesForAudit(params);
+    const decision = await this.enforce(requestId, params.model, messages, metadata, 'anthropic');
+    const fallback = this.fallbackRequest(decision, requestId, params.model, messages, metadata, 'anthropic');
 
     const response = await this.anthropic.messages.create(params);
 
     if (params.stream) {
       return this.wrapAnthropicStream(response, (output, inputTokens, outputTokens) =>
         this.sendResponseEvent(
-          requestId, params.model, output, inputTokens, outputTokens, metadata, 'anthropic'
+          requestId, params.model, output, inputTokens, outputTokens, metadata, 'anthropic', fallback
         )
       );
     }
@@ -686,7 +720,7 @@ export class SignalVaultClient {
         requestId, params.model, anthropicOutputText(response),
         response.usage?.input_tokens || 0,
         response.usage?.output_tokens || 0,
-        metadata, 'anthropic'
+        metadata, 'anthropic', fallback
       )
     );
     return response;
@@ -786,7 +820,51 @@ export class SignalVaultClient {
       `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent ` +
         `to the provider unchecked (failMode: 'open').`
     );
-    return { ...ALLOW, violations: [], redactions: [] };
+    const decision: SignalVaultDecision = { ...ALLOW, violations: [], redactions: [] };
+    (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED] =
+      RECORDABLE_CAUSES.has(key) ? 'record' : 'skip';
+    return decision;
+  }
+
+  /**
+   * The ai.request body to record in the background when the pre-flight got
+   * no decision, so an unchecked call is still in the audit log. Undefined
+   * when the pre-flight was recorded normally; null when the server refused
+   * it and no audit event should be sent.
+   */
+  private fallbackRequest(
+    decision: SignalVaultDecision,
+    requestId: string,
+    model: string,
+    messages: unknown[],
+    metadata: Record<string, unknown>,
+    provider: string
+  ): Record<string, unknown> | null | undefined {
+    const failed = (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED];
+    if (failed === undefined) return undefined;
+    if (failed === 'skip') return null;
+    return {
+      ...this.requestBody(requestId, model, messages, metadata, provider),
+      payload: { messages, preflight_unavailable: true },
+    };
+  }
+
+  private requestBody(
+    requestId: string,
+    model: string,
+    messages: unknown[],
+    metadata: Record<string, unknown>,
+    provider: string
+  ): Record<string, unknown> {
+    return {
+      type: 'ai.request',
+      request_id: requestId,
+      environment: this.svEnvironment,
+      provider,
+      model,
+      metadata,
+      payload: { messages },
+    };
   }
 
   private async describeFailure(status: number, response?: Response): Promise<[string, string]> {
@@ -845,14 +923,19 @@ export class SignalVaultClient {
   }
 
   /**
-   * POST for background events. Adds an `event_id` so a retry can never be
-   * double-counted, and retries once on network errors, 5xx, and on 429 when
-   * Retry-After is short. Returns null if the event could not be delivered.
+   * POST for background events. Adds an `event_id` so a retry is never
+   * double-counted, and retries once on connection errors, 5xx, and 429 with a
+   * short Retry-After. Timeouts are not retried: the server may be slow rather
+   * than down, and a retry would double the time the event is held. Returns
+   * the last response, or null if nothing was received.
    */
-  private async postBackground(body: Record<string, unknown>): Promise<PostResult | null> {
-    const event = { event_id: randomUUID(), ...body };
+  private async postBackground(
+    body: Record<string, unknown>,
+    { eventId = true, retry = true }: BackgroundOptions = {}
+  ): Promise<PostResult | null> {
+    const event = eventId ? { event_id: randomUUID(), ...body } : body;
     let result: PostResult | null = null;
-    let retryDelayMs: number | null;
+    let retryDelayMs: number | null = null;
 
     try {
       result = await this.post(event, this.bgTimeout);
@@ -860,29 +943,33 @@ export class SignalVaultClient {
       if (result.status === 429) {
         const retryAfter = parseRetryAfterMs(result.response);
         retryDelayMs = retryAfter !== null && retryAfter <= MAX_RETRY_AFTER_MS ? retryAfter : null;
-      } else {
-        retryDelayMs = result.status >= 500 ? 250 + Math.random() * 500 : null;
+      } else if (result.status >= 500) {
+        retryDelayMs = 250 + Math.random() * 500;
       }
-    } catch (error) {
-      if (this.debugMode) console.error('[SignalVault] Event send failed, retrying once:', error);
-      retryDelayMs = 250 + Math.random() * 500;
-    }
-
-    if (retryDelayMs === null) {
-      if (result?.status === 429) {
-        this.warn('bg-429', '[SignalVault] Rate limited (429): audit events are being dropped.');
-      } else if (result && this.debugMode) {
-        console.error('[SignalVault] Event rejected:', result.status);
-      }
-      return result;
-    }
-
-    await sleep(retryDelayMs);
-    try {
-      return await this.post(event, this.bgTimeout);
     } catch (error) {
       if (this.debugMode) console.error('[SignalVault] Event send failed:', error);
-      return result;
+      if (!isTimeout(error)) retryDelayMs = 250 + Math.random() * 500;
+    }
+
+    if (retry && retryDelayMs !== null) {
+      await sleep(retryDelayMs);
+      try {
+        result = await this.post(event, this.bgTimeout);
+        if (result.ok) return result;
+      } catch (error) {
+        if (this.debugMode) console.error('[SignalVault] Event retry failed:', error);
+      }
+    }
+
+    this.logUndelivered(result);
+    return result;
+  }
+
+  private logUndelivered(result: PostResult | null): void {
+    if (result?.status === 429) {
+      this.warn('bg-429', '[SignalVault] Rate limited (429): audit events are being dropped.');
+    } else if (this.debugMode) {
+      console.error('[SignalVault] Event not delivered:', result ? result.status : 'no response');
     }
   }
 
@@ -896,19 +983,11 @@ export class SignalVaultClient {
     let result: PostResult;
     try {
       result = await this.post(
-        {
-          type: 'ai.request',
-          request_id: requestId,
-          environment: this.svEnvironment,
-          provider,
-          model,
-          metadata,
-          payload: { messages },
-        },
+        this.requestBody(requestId, model, messages, metadata, provider),
         this.preflightTimeout
       );
     } catch (error) {
-      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      const timedOut = isTimeout(error);
       if (this.debugMode) console.error('[SignalVault] Pre-flight failed:', error);
       return this.unavailable(
         requestId,
@@ -927,7 +1006,12 @@ export class SignalVaultClient {
     let data: any;
     try {
       data = await result.response!.json();
-    } catch {
+    } catch (error) {
+      if (isTimeout(error)) {
+        return this.unavailable(
+          requestId, 'timeout', `SignalVault pre-flight check timed out after ${this.preflightTimeout}ms`
+        );
+      }
       return this.unavailable(requestId, 'invalid-response', 'SignalVault returned an invalid response');
     }
     if (!data || typeof data !== 'object' || !DECISIONS.has(data.decision)) {
@@ -936,7 +1020,9 @@ export class SignalVaultClient {
 
     return {
       decision: data.decision,
-      violations: Array.isArray(data.violations) ? data.violations : [],
+      violations: Array.isArray(data.violations)
+        ? data.violations.filter((v: unknown) => v !== null && typeof v === 'object')
+        : [],
       redactions: Array.isArray(data.redactions) ? data.redactions : [],
       dashboard_url: typeof data.dashboard_url === 'string' ? data.dashboard_url : undefined,
     };
@@ -949,8 +1035,15 @@ export class SignalVaultClient {
     promptTokens: number,
     completionTokens: number,
     metadata: Record<string, unknown>,
-    provider: string
+    provider: string,
+    fallbackRequest?: Record<string, unknown> | null
   ): Promise<void> {
+    if (fallbackRequest === null) return;
+    if (fallbackRequest) {
+      // Must land before the response: the server rejects an ai.response whose
+      // ai.request it has not stored.
+      await this.postBackground(fallbackRequest, { eventId: false });
+    }
     await this.postBackground({
       type: 'ai.response',
       request_id: requestId,

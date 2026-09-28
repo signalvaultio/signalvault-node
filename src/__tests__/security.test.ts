@@ -54,7 +54,7 @@ function openaiStub(chunks?: unknown[]) {
 
 function makeClient(config: Partial<SignalVaultConfig> = {}) {
   const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake', ...config });
-  const openai = openaiStub(config as any);
+  const openai = openaiStub();
   (client as any).openai = openai.client;
   return { client, openai };
 }
@@ -277,8 +277,11 @@ describe('background delivery', () => {
     });
     const { client } = makeClient();
 
-    const completion = await client.chat.completions.create({ model: 'm', messages });
-    expect(completion.choices[0].message.content).toBe('hello');
+    const outcome = await Promise.race([
+      client.chat.completions.create({ model: 'm', messages }).then((c) => c.choices[0].message.content),
+      new Promise((resolve) => setTimeout(() => resolve('blocked on the response event'), 500)),
+    ]);
+    expect(outcome).toBe('hello');
     release();
     await client.flush();
   });
@@ -327,5 +330,135 @@ describe('background delivery', () => {
     expect(delivered).toBe(false);
     await client.flush();
     expect(delivered).toBe(true);
+  });
+});
+
+describe('audit when the pre-flight got no decision', () => {
+  it('records the request (deduplicated by request_id) before the response on 503', async () => {
+    const f = stubFetch({ 'ai.request': [{ status: 503 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    expect(f.types()).toEqual(['ai.request', 'ai.request', 'ai.response']);
+    const fallback = f.calls[1].body;
+    expect(fallback.request_id).toBe(f.calls[0].body.request_id);
+    expect(fallback.event_id).toBeUndefined();
+    expect(fallback.payload).toEqual({ messages, preflight_unavailable: true });
+  });
+
+  it('sends no audit events after the server refused the pre-flight (401)', async () => {
+    const f = stubFetch({ 'ai.request': [{ status: 401 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(f.types()).toEqual(['ai.request']);
+  });
+});
+
+describe('failure classification', () => {
+  it('reports a redirect as a baseUrl problem', async () => {
+    stubFetch({ 'ai.request': [{ status: 307, headers: { location: 'https://elsewhere' } }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    expect(warnSpy.mock.calls[0][0]).toMatch(/redirected \(307\).*baseUrl/);
+  });
+
+  it('reports a timeout as a timeout, and fail-closed throws on it', async () => {
+    jest.spyOn(global, 'fetch').mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
+    const open = makeClient();
+    await open.client.chat.completions.create({ model: 'm', messages });
+    expect(warnSpy.mock.calls[0][0]).toMatch(/timed out after 2000ms/);
+
+    const closed = makeClient({ failMode: 'closed' });
+    await expect(closed.client.chat.completions.create({ model: 'm', messages })).rejects.toBeInstanceOf(
+      SignalVaultUnavailableError
+    );
+    expect(closed.openai.sent).toHaveLength(0);
+  });
+
+  it('fail-closed throws on a network error', async () => {
+    jest.spyOn(global, 'fetch').mockRejectedValue(new TypeError('fetch failed'));
+    const { client, openai } = makeClient({ failMode: 'closed' });
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultUnavailableError);
+    expect(err.message).toMatch(/unreachable/);
+    expect(openai.sent).toHaveLength(0);
+  });
+
+  it('survives malformed violations in a block decision', async () => {
+    stubFetch({
+      'ai.request': [{ status: 200, body: { decision: 'block', violations: [null, 7, { type: 9 }, { type: 'pii' }] } }],
+    });
+    const { client } = makeClient();
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultBlockedError);
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (9, pii).');
+  });
+});
+
+describe('background retry policy', () => {
+  it('does not retry a timed-out event', async () => {
+    let responses = 0;
+    jest.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      const type = JSON.parse((init as RequestInit).body as string).type;
+      if (type === 'ai.response') {
+        responses++;
+        throw new DOMException('timed out', 'TimeoutError');
+      }
+      return new Response(JSON.stringify(allow.body), { status: 200 });
+    });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(responses).toBe(1);
+  });
+
+  it('warns when the retry is rate limited too', async () => {
+    stubFetch({
+      'ai.request': [allow],
+      'ai.response': [
+        { status: 429, headers: { 'retry-after': '0' } },
+        { status: 429, headers: { 'retry-after': '60' } },
+      ],
+    });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(warnSpy.mock.calls.some((c) => /events are being dropped/.test(c[0]))).toBe(true);
+  });
+
+  it('tools.record() does not retry', async () => {
+    const f = stubFetch({ 'agent.tool_call': [{ status: 503 }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.tools.record({ toolName: 't', durationMs: 1 });
+    expect(f.types()).toEqual(['agent.tool_call']);
+  });
+});
+
+describe('stream that throws', () => {
+  it('records the partial output and rethrows', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    (client as any).openai = {
+      chat: {
+        completions: {
+          create: async () =>
+            (async function* () {
+              yield { choices: [{ delta: { content: 'par' } }] };
+              throw new Error('connection reset');
+            })(),
+        },
+      },
+    };
+
+    const stream = await client.chat.completions.create({ model: 'm', messages, stream: true });
+    await expect(
+      (async () => {
+        for await (const _ of stream) void _;
+      })()
+    ).rejects.toThrow('connection reset');
+    await client.flush();
+    expect(f.calls.find((c) => c.body.type === 'ai.response')?.body.payload.output).toBe('par');
   });
 });

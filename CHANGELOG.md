@@ -17,18 +17,21 @@ Security and reliability release.
 - New `failMode: 'open' | 'closed'` option. With `'closed'`, the SDK throws `SignalVaultUnavailableError` instead of calling the provider unchecked. Default stays `'open'`.
 - The Anthropic `system` prompt is now included in the pre-flight scan and the audit record.
 - Requests to SignalVault no longer follow redirects, so the API key is never re-sent to another URL.
+- When the pre-flight check could not be completed (unreachable, timeout, 5xx, invalid response) and the request went ahead unchecked, the request is now recorded in the background, marked `preflight_unavailable`. Previously only the response was sent, which the API rejects, so these calls were missing from the audit log. After a refused check (401/402/403/429) no audit events are sent.
+- Malformed decisions (for example a non-object violation) no longer throw a `TypeError` into the caller.
 
 ### Fixes
 
 - Mirror mode sends `ai.request` before `ai.response` instead of concurrently, so response events are no longer lost to a race.
-- Streams record the (partial) response when the consumer stops iterating early or the stream throws.
+- Streams record the (partial) response when the consumer stops iterating early or the stream throws. A stream that is never iterated is not recorded.
+- Timeouts are detected by error name, so they are classified correctly across realms (for example under Jest).
 - Normal-mode non-streaming calls no longer wait for the response audit event before returning.
 - Anthropic responses record every text block, not only the first.
 
 ### Added
 
 - `flush()` / `close()` wait for queued audit events before a process exits.
-- Every background event carries an `event_id`; the SDK retries once on network errors and 5xx, and on 429 when `Retry-After` is 5 seconds or less.
+- Every background event carries an `event_id`. The SDK retries once on connection errors and 5xx (not timeouts), and on 429 only when `Retry-After` is 5 seconds or less, which the SignalVault API does not currently send. `tools.record()` does not retry; its events also carry an `event_id`.
 - `Accept: application/json` and `User-Agent: signalvault-node/<version>` headers.
 
 ### Other

@@ -62,7 +62,7 @@ console.log(response.content[0].text);
 
 ## Streaming
 
-Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early:
+Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early or the stream fails. A stream you never iterate is not logged.
 
 ```typescript
 // OpenAI streaming
@@ -180,8 +180,12 @@ const response = await client.chat.completions.create(
 
 The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, or an invalid response — `failMode` decides what happens:
 
-- `'open'` (default): the request goes to the provider **without** guardrails, and the SDK prints a warning (at most once a minute per cause, whether or not `debug` is on).
-- `'closed'`: the SDK throws `SignalVaultUnavailableError` and the provider is never called.
+- `'open'` (default): the request goes to the provider **without** guardrails, and the SDK prints a warning (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
+- `'closed'`: the SDK throws `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
+
+`failMode` applies to the pre-flight check, so it has no effect in mirror mode.
+
+**Rate limit.** The ingest API allows 120 events per minute per app, and each call sends two (request and response), plus one per tool call. Above roughly 60 LLM calls a minute, pre-flight checks are rate limited: with `failMode: 'open'` those requests go through unchecked. If you run at that volume and need enforcement, use `failMode: 'closed'`.
 
 ```typescript
 const client = new SignalVaultClient({
@@ -193,7 +197,7 @@ const client = new SignalVaultClient({
 });
 ```
 
-Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted; the SDK retries once on network errors and 5xx, and on 429 when `Retry-After` is 5 seconds or less. The ingest API allows 120 events per minute per app.
+Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted. The SDK retries once on connection errors and 5xx (not on timeouts). A rate-limited (429) event is retried only if `Retry-After` is 5 seconds or less; the SignalVault API currently asks for 60, so in practice those events are dropped, with a warning. `tools.record()` does not retry.
 
 ## Shutting Down
 
