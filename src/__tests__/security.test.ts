@@ -81,6 +81,11 @@ describe('baseUrl', () => {
     expect(() => makeClient({ baseUrl: 'http://api.signalvault.io' })).toThrow(/must use https/);
   });
 
+  it('refuses a query string or fragment', () => {
+    expect(() => normalizeBaseUrl('https://api.signalvault.io?x=1')).toThrow(/query or fragment/);
+    expect(() => normalizeBaseUrl('https://api.signalvault.io#frag')).toThrow(/query or fragment/);
+  });
+
   it('refuses invalid URLs and other schemes', () => {
     expect(() => normalizeBaseUrl('api.signalvault.io')).toThrow(/not a valid URL/);
     expect(() => normalizeBaseUrl('ftp://api.signalvault.io')).toThrow(/https/);

@@ -7,7 +7,7 @@ Security and reliability release.
 ### Breaking changes
 
 - **Default `baseUrl` is now `https://api.signalvault.io`** (was `http://localhost:4000`). Set `baseUrl` explicitly for local development.
-- **Plain `http://` base URLs are refused** except for `localhost`, `127.0.0.1` and `::1`. The API key and prompts would otherwise travel unencrypted.
+- **Plain `http://` base URLs are refused** except for `localhost`, `127.0.0.1` and `::1`. The API key and prompts would otherwise travel unencrypted. A `baseUrl` with a query string or fragment is refused too.
 - **Blocked requests throw `SignalVaultBlockedError`** with `violations`, `requestId` and `dashboardUrl` properties. The message no longer embeds the violations JSON; it lists the violation types.
 - **`SignalVaultDecision.redactions`** is now `Array<{ type, count }>`, matching the API. Check `.length`, not truthiness.
 

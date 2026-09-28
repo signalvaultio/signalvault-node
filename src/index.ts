@@ -64,6 +64,9 @@ export function normalizeBaseUrl(raw: string): string {
         'Your API key and prompts would otherwise be sent unencrypted.'
     );
   }
+  if (url.search || url.hash) {
+    throw new Error(`[SignalVault] baseUrl must not contain a query or fragment: ${raw}`);
+  }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     throw new Error(`[SignalVault] baseUrl must be an https:// URL, got ${url.protocol}`);
   }
