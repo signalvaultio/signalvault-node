@@ -1,0 +1,331 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import {
+  SDK_VERSION,
+  SignalVaultBlockedError,
+  SignalVaultClient,
+  SignalVaultConfig,
+  SignalVaultUnavailableError,
+  normalizeBaseUrl,
+} from '../index';
+
+type Reply = { status: number; body?: unknown; headers?: Record<string, string> };
+
+/**
+ * Stubs global fetch. `replies` maps an event type to the replies returned
+ * for successive calls of that type; unmatched calls get 200 {}.
+ */
+function stubFetch(replies: Record<string, Reply[]> = {}) {
+  const calls: Array<{ body: any; init: RequestInit }> = [];
+  const spy = jest.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+    const body = JSON.parse((init as RequestInit).body as string);
+    calls.push({ body, init: init as RequestInit });
+    const reply = replies[body.type]?.shift() ?? { status: 200, body: {} };
+    const text = typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body ?? {});
+    return new Response(text, { status: reply.status, headers: reply.headers });
+  });
+  return { calls, spy, types: () => calls.map((c) => c.body.type) };
+}
+
+function openaiStub(chunks?: unknown[]) {
+  const sent: any[] = [];
+  return {
+    sent,
+    client: {
+      chat: {
+        completions: {
+          create: async (params: any) => {
+            sent.push(params);
+            if (params.stream) {
+              return (async function* () {
+                for (const c of chunks ?? []) yield c;
+              })();
+            }
+            return {
+              choices: [{ message: { content: 'hello' } }],
+              usage: { prompt_tokens: 3, completion_tokens: 1 },
+            };
+          },
+        },
+      },
+    },
+  };
+}
+
+function makeClient(config: Partial<SignalVaultConfig> = {}) {
+  const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake', ...config });
+  const openai = openaiStub(config as any);
+  (client as any).openai = openai.client;
+  return { client, openai };
+}
+
+const allow = { status: 200, body: { decision: 'allow', violations: [], redactions: [] } };
+const messages = [{ role: 'user' as const, content: 'hi' }];
+
+let warnSpy: jest.SpyInstance;
+beforeEach(() => {
+  warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+});
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+describe('baseUrl', () => {
+  it('accepts https and localhost http', () => {
+    expect(normalizeBaseUrl('https://api.signalvault.io/')).toBe('https://api.signalvault.io');
+    expect(normalizeBaseUrl('http://localhost:4000')).toBe('http://localhost:4000');
+    expect(normalizeBaseUrl('http://127.0.0.1:4000')).toBe('http://127.0.0.1:4000');
+  });
+
+  it('refuses plaintext http to remote hosts', () => {
+    expect(() => makeClient({ baseUrl: 'http://api.signalvault.io' })).toThrow(/must use https/);
+  });
+
+  it('refuses invalid URLs and other schemes', () => {
+    expect(() => normalizeBaseUrl('api.signalvault.io')).toThrow(/not a valid URL/);
+    expect(() => normalizeBaseUrl('ftp://api.signalvault.io')).toThrow(/https/);
+  });
+});
+
+describe('request headers', () => {
+  it('sends Accept, User-Agent and an event_id on background events', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    const headers = f.calls[0].init.headers as Record<string, string>;
+    expect(headers.Accept).toBe('application/json');
+    expect(headers['User-Agent']).toMatch(/^signalvault-node\/\d+\.\d+\.\d+ node\//);
+    expect(f.calls[0].init.redirect).toBe('manual');
+    expect(f.calls[1].body.type).toBe('ai.response');
+    expect(f.calls[1].body.event_id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('SDK_VERSION matches package.json', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf8'));
+    expect(SDK_VERSION).toBe(pkg.version);
+  });
+});
+
+describe('pre-flight failures', () => {
+  it.each([
+    [401, { errors: { detail: 'Unauthorized' } }, /API key/],
+    [402, { error: 'subscription_inactive' }, /not active/],
+    [403, { error: 'environment_not_allowed' }, /denied access/],
+    [429, { error: 'rate_limited' }, /rate limit/],
+    [429, { error: { type: 'trial_limit_exceeded' } }, /trial limit/],
+    [503, {}, /API error/],
+  ])('fail-open warns loudly on %i (not only in debug)', async (status, body, pattern) => {
+    stubFetch({ 'ai.request': [{ status, body }] });
+    const { client, openai } = makeClient();
+
+    await client.chat.completions.create({ model: 'm', messages });
+
+    expect(openai.sent).toHaveLength(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(pattern);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/NOT applied/);
+  });
+
+  it('warns at most once per minute for the same failure', async () => {
+    stubFetch({ 'ai.request': [{ status: 401 }, { status: 401 }, { status: 401 }] });
+    const { client } = makeClient();
+    for (let i = 0; i < 3; i++) await client.chat.completions.create({ model: 'm', messages });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('fail-closed throws and never calls the provider', async () => {
+    stubFetch({ 'ai.request': [{ status: 401 }] });
+    const { client, openai } = makeClient({ failMode: 'closed' });
+
+    await expect(client.chat.completions.create({ model: 'm', messages })).rejects.toBeInstanceOf(
+      SignalVaultUnavailableError
+    );
+    expect(openai.sent).toHaveLength(0);
+  });
+
+  it('treats a non-JSON 200 as unavailable instead of crashing', async () => {
+    stubFetch({ 'ai.request': [{ status: 200, body: '<html>maintenance</html>' }] });
+    const { client, openai } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    expect(openai.sent).toHaveLength(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/invalid response/);
+  });
+
+  it('rejects an unknown failMode', () => {
+    expect(() => makeClient({ failMode: 'maybe' as any })).toThrow(/failMode/);
+  });
+});
+
+describe('decisions', () => {
+  it('block throws SignalVaultBlockedError carrying violations and dashboard_url', async () => {
+    const violations = [{ rule_id: 'r1', type: 'contains_secret', severity: 9, action: 'block', details: {} }];
+    stubFetch({
+      'ai.request': [{ status: 200, body: { decision: 'block', violations, redactions: [], dashboard_url: 'https://signalvault.io/x' } }],
+    });
+    const { client, openai } = makeClient();
+
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultBlockedError);
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (contains_secret).');
+    expect(err.violations).toEqual(violations);
+    expect(err.dashboardUrl).toBe('https://signalvault.io/x');
+    expect(openai.sent).toHaveLength(0);
+  });
+
+  it('parses redactions as an array and still sends the request unmodified', async () => {
+    stubFetch({
+      'ai.request': [{ status: 200, body: { decision: 'redact', violations: [], redactions: [{ type: 'contains_pii', count: 1 }] } }],
+    });
+    const { client, openai } = makeClient();
+    const decision = await (client as any).sendRequest('r', 'm', messages, {}, 'openai');
+    expect(decision.redactions).toEqual([{ type: 'contains_pii', count: 1 }]);
+
+    await client.chat.completions.create({ model: 'm', messages });
+    expect(openai.sent[0].messages).toEqual(messages);
+  });
+});
+
+describe('Anthropic system prompt', () => {
+  function anthropicClient() {
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    const sent: any[] = [];
+    (client as any).anthropic = {
+      messages: {
+        create: async (p: any) => {
+          sent.push(p);
+          return {
+            content: [
+              { type: 'text', text: 'Let me check. ' },
+              { type: 'tool_use', id: 't', name: 'lookup', input: {} },
+              { type: 'text', text: 'Done.' },
+            ],
+            usage: { input_tokens: 5, output_tokens: 2 },
+          };
+        },
+      },
+    };
+    return { client, sent };
+  }
+
+  it('is included in the pre-flight scan; the provider call is unchanged', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = anthropicClient();
+
+    await client.messages.create({ model: 'claude', max_tokens: 5, system: 'SYS sk-secret', messages });
+    await client.flush();
+
+    expect(f.calls[0].body.payload.messages[0]).toEqual({ role: 'system', content: 'SYS sk-secret' });
+    expect(sent[0].system).toBe('SYS sk-secret');
+    expect(sent[0].messages).toEqual(messages);
+  });
+
+  it('records every text block of the response, not only the first', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const { client } = anthropicClient();
+    await client.messages.create({ model: 'claude', max_tokens: 5, messages });
+    await client.flush();
+    expect(f.calls[1].body.payload.output).toBe('Let me check. Done.');
+  });
+});
+
+describe('mirror mode', () => {
+  it('sends ai.request before ai.response, never concurrently', async () => {
+    const order: string[] = [];
+    jest.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      const type = JSON.parse((init as RequestInit).body as string).type;
+      order.push(`start:${type}`);
+      await new Promise((r) => setTimeout(r, 10));
+      order.push(`end:${type}`);
+      return new Response('{}', { status: 200 });
+    });
+    const { client } = makeClient({ mirrorMode: true });
+
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    expect(order).toEqual(['start:ai.request', 'end:ai.request', 'start:ai.response', 'end:ai.response']);
+  });
+});
+
+describe('streaming', () => {
+  const chunk = (t: string) => ({ choices: [{ delta: { content: t } }] });
+
+  it('records the partial response when the consumer breaks out early', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    (client as any).openai = openaiStub([chunk('a'), chunk('b'), chunk('c')]).client;
+
+    const stream = await client.chat.completions.create({ model: 'm', messages, stream: true });
+    for await (const _ of stream) break;
+    await client.flush();
+
+    const response = f.calls.find((c) => c.body.type === 'ai.response');
+    expect(response?.body.payload.output).toBe('a');
+  });
+});
+
+describe('background delivery', () => {
+  it('does not wait for the response event before returning the completion', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    jest.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      const type = JSON.parse((init as RequestInit).body as string).type;
+      if (type === 'ai.response') await gate;
+      return new Response(JSON.stringify(allow.body), { status: 200 });
+    });
+    const { client } = makeClient();
+
+    const completion = await client.chat.completions.create({ model: 'm', messages });
+    expect(completion.choices[0].message.content).toBe('hello');
+    release();
+    await client.flush();
+  });
+
+  it('retries once on 503 with the same event_id', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    const responses = f.calls.filter((c) => c.body.type === 'ai.response');
+    expect(responses).toHaveLength(2);
+    expect(responses[0].body.event_id).toBe(responses[1].body.event_id);
+  });
+
+  it('honours a short Retry-After on 429 and drops with a warning on a long one', async () => {
+    const f = stubFetch({
+      'ai.request': [allow, allow],
+      'ai.response': [
+        { status: 429, headers: { 'retry-after': '0' } },
+        { status: 200 },
+        { status: 429, headers: { 'retry-after': '60' } },
+      ],
+    });
+    const { client } = makeClient();
+
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(2);
+
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(3);
+    expect(warnSpy.mock.calls.some((c) => /events are being dropped/.test(c[0]))).toBe(true);
+  });
+
+  it('flush() waits for pending tool events', async () => {
+    let delivered = false;
+    jest.spyOn(global, 'fetch').mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      delivered = true;
+      return new Response('{}', { status: 200 });
+    });
+    const { client } = makeClient();
+    await client.tool('t', async () => 1)();
+    expect(delivered).toBe(false);
+    await client.flush();
+    expect(delivered).toBe(true);
+  });
+});

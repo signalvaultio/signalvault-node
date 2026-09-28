@@ -1,0 +1,38 @@
+# Changelog
+
+## 0.4.0
+
+Security and reliability release.
+
+### Breaking changes
+
+- **Default `baseUrl` is now `https://api.signalvault.io`** (was `http://localhost:4000`). Set `baseUrl` explicitly for local development.
+- **Plain `http://` base URLs are refused** except for `localhost`, `127.0.0.1` and `::1`. The API key and prompts would otherwise travel unencrypted.
+- **Blocked requests throw `SignalVaultBlockedError`** with `violations`, `requestId` and `dashboardUrl` properties. The message no longer embeds the violations JSON; it lists the violation types.
+- **`SignalVaultDecision.redactions`** is now `Array<{ type, count }>`, matching the API. Check `.length`, not truthiness.
+
+### Security
+
+- A failed guardrail check is no longer silent. An invalid key (401), inactive account (402), denied access (403), rate or trial limit (429), server error, timeout or invalid response now prints a warning (at most once a minute per cause) even with `debug: false`.
+- New `failMode: 'open' | 'closed'` option. With `'closed'`, the SDK throws `SignalVaultUnavailableError` instead of calling the provider unchecked. Default stays `'open'`.
+- The Anthropic `system` prompt is now included in the pre-flight scan and the audit record.
+- Requests to SignalVault no longer follow redirects, so the API key is never re-sent to another URL.
+
+### Fixes
+
+- Mirror mode sends `ai.request` before `ai.response` instead of concurrently, so response events are no longer lost to a race.
+- Streams record the (partial) response when the consumer stops iterating early or the stream throws.
+- Normal-mode non-streaming calls no longer wait for the response audit event before returning.
+- Anthropic responses record every text block, not only the first.
+
+### Added
+
+- `flush()` / `close()` wait for queued audit events before a process exits.
+- Every background event carries an `event_id`; the SDK retries once on network errors and 5xx, and on 429 when `Retry-After` is 5 seconds or less.
+- `Accept: application/json` and `User-Agent: signalvault-node/<version>` headers.
+
+### Other
+
+- Dropped the `uuid` dependency in favour of `crypto.randomUUID`.
+- Compiled tests are no longer included in the npm package.
+- Added a LICENSE file.

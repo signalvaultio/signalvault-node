@@ -62,7 +62,7 @@ console.log(response.content[0].text);
 
 ## Streaming
 
-Streaming is fully supported for both providers. SignalVault logs the complete response once the stream finishes:
+Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early:
 
 ```typescript
 // OpenAI streaming
@@ -90,6 +90,8 @@ for await (const event of stream) {
   }
 }
 ```
+
+For token counts on OpenAI streams, pass `stream_options: { include_usage: true }`. The SDK does not add it for you, because OpenAI then sends a final chunk with an empty `choices` array.
 
 ## Agent Tool-Use Capture
 
@@ -130,14 +132,15 @@ When you wrap a tool or call `tools.record()`, SignalVault captures:
 - `error.message` if the tool throws (truncated to 1900 bytes)
 - `duration_ms`, `started_at`, and any `metadata` you attach
 
-These fields are stored encrypted at rest server-side, but they go on the wire
-to SignalVault's API. **If you pass user PII, secrets, or API keys as tool
-arguments, those values will leave your process and be stored in SignalVault.**
-Recommendations:
+`tool_input` and `tool_output` are encrypted at rest server-side. `tool_name`,
+`error`, `started_at` and `metadata` are stored as sent, **not encrypted**. All of
+it goes on the wire to SignalVault's API: **if you pass user PII, secrets, or API
+keys as tool arguments, those values will leave your process and be stored in
+SignalVault.** Recommendations:
 
 - Sanitize sensitive arguments before invoking the wrapped tool, or use the
   manual `tools.record()` API and pass a redacted copy.
-- Don't put secrets in error messages — they end up in `error` verbatim.
+- Don't put secrets in error messages — they end up in `error` verbatim and unencrypted.
 - Use `metadata` for non-sensitive identifiers (`user_id`, `feature`,
   `workspace_id`); avoid putting raw user content in metadata.
 
@@ -173,17 +176,31 @@ const response = await client.chat.completions.create(
 );
 ```
 
-## Timeout Configuration
+## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. SignalVaultClient uses a short timeout and **fails open** — your request always goes through even if the SignalVault API is slow or unreachable:
+The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, or an invalid response — `failMode` decides what happens:
+
+- `'open'` (default): the request goes to the provider **without** guardrails, and the SDK prints a warning (at most once a minute per cause, whether or not `debug` is on).
+- `'closed'`: the SDK throws `SignalVaultUnavailableError` and the provider is never called.
 
 ```typescript
 const client = new SignalVaultClient({
   apiKey: 'sk_live_...',
   openaiApiKey: process.env.OPENAI_API_KEY!,
-  preflightTimeout: 2000,  // ms — pre-flight check timeout (fails open). Default: 2000
+  failMode: 'closed',      // 'open' | 'closed'. Default: 'open'
+  preflightTimeout: 2000,  // ms — pre-flight check timeout. Default: 2000
   timeout: 10000,          // ms — background/post-flight calls. Default: 10000
 });
+```
+
+Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted; the SDK retries once on network errors and 5xx, and on 429 when `Retry-After` is 5 seconds or less. The ingest API allows 120 events per minute per app.
+
+## Shutting Down
+
+Background events are queued in memory. Before a short-lived process exits (a script, a serverless handler), wait for them:
+
+```typescript
+await client.flush();   // or client.close(); both wait up to 5s by default
 ```
 
 ## Mirror Mode
@@ -201,7 +218,8 @@ const client = new SignalVaultClient({
 ## Features
 
 - **Automatic Logging** — Every request and response is recorded in your SignalVault dashboard
-- **Pre-flight Guardrails** — Block or redact requests before they reach the AI provider
+- **Pre-flight Guardrails** — Block requests that break your rules before they reach the AI provider
+- **Redaction at rest** — Rules with the `redact` action remove matches from what SignalVault stores. The request sent to the AI provider is **not** modified.
 - **PII Detection** — Automatically detect emails, phone numbers, SSNs in prompts
 - **Secret Detection** — Block API keys and tokens in prompts
 - **Token Limits** — Enforce cost controls per request
@@ -218,10 +236,11 @@ const client = new SignalVaultClient({
   apiKey: 'sk_live_...',            // Your SignalVault API key (required)
   openaiApiKey: 'sk-...',           // OpenAI API key (required for chat.completions)
   anthropicApiKey: 'sk-ant-...',    // Anthropic API key (required for messages)
-  baseUrl: 'https://api.signalvault.io',
-  environment: 'production',        // 'development' | 'staging' | 'production'
+  baseUrl: 'https://api.signalvault.io', // default; plain http:// only allowed for localhost
+  environment: 'production',        // sent with events; the server uses the API key's environment
   debug: false,
   mirrorMode: false,
+  failMode: 'open',                 // 'open' | 'closed' — see "When SignalVault Is Unavailable"
   preflightTimeout: 2000,           // ms
   timeout: 10000,                   // ms
   metadata: {},                     // Default metadata for all events
@@ -231,14 +250,22 @@ const client = new SignalVaultClient({
 ## Error Handling
 
 ```typescript
+import { SignalVaultBlockedError, SignalVaultUnavailableError } from '@signalvaultio/node';
+
 try {
   const response = await client.chat.completions.create({
     model: 'gpt-4',
     messages: [{ role: 'user', content: 'my SSN is 123-45-6789' }],
   });
 } catch (error) {
-  if (error.message.includes('[SignalVault]')) {
-    console.log('Request blocked by guardrail');
+  if (error instanceof SignalVaultBlockedError) {
+    console.log('Blocked by guardrails:', error.violations.map((v) => v.type));
+    console.log('Details:', error.dashboardUrl);
+  } else if (error instanceof SignalVaultUnavailableError) {
+    // Only thrown with failMode: 'closed'
+    console.log('Guardrail check unavailable:', error.status);
+  } else {
+    throw error;
   }
 }
 ```
