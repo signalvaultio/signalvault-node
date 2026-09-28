@@ -1,0 +1,50 @@
+name: Release
+
+# Stages a release on npm via trusted publishing (OIDC) when a vX.Y.Z tag is pushed.
+# No npm token is stored anywhere; npm trusts this workflow file in this repo.
+# The `release` environment requires manual approval before the job runs, and
+# the trusted publisher is stage-only: the version goes live only after a
+# maintainer approves it with 2FA (npmjs.com → Staged Packages, or
+# `npm stage approve <stage-id>`).
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Staged publishing needs npm >= 11.15.0 (and Node >= 22.14).
+      - run: npm install -g npm@^11.15.0
+
+      - name: Check tag matches package.json version
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME#v}" != "$pkg_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $pkg_version"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+
+      - run: npm stage publish --access public --provenance
