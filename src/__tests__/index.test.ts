@@ -16,9 +16,9 @@ describe('SignalVaultClient', () => {
       );
     });
 
-    it('defaults to localhost and production', () => {
+    it('defaults to the production API over https', () => {
       const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
-      expect((client as any).svBaseUrl).toBe('http://localhost:4000');
+      expect((client as any).svBaseUrl).toBe('https://api.signalvault.io');
       expect((client as any).svEnvironment).toBe('production');
       expect((client as any).debugMode).toBe(false);
       expect((client as any).mirrorMode).toBe(false);
@@ -99,6 +99,7 @@ describe('SignalVaultClient', () => {
 
   describe('fail-open on preflight timeout', () => {
     it('sendRequest returns allow decision on fetch error', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const client = new SignalVaultClient({
         apiKey: 'sk_test_abc',
         openaiApiKey: 'sk-fake',
@@ -110,6 +111,8 @@ describe('SignalVaultClient', () => {
       );
       expect(decision.decision).toBe('allow');
       expect(decision.violations).toEqual([]);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      warnSpy.mockRestore();
     });
   });
 });
