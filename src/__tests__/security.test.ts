@@ -467,3 +467,139 @@ describe('stream that throws', () => {
     expect(f.calls.find((c) => c.body.type === 'ai.response')?.body.payload.output).toBe('par');
   });
 });
+
+describe('OpenAI streaming usage', () => {
+  const content = (t: string) => ({ choices: [{ index: 0, delta: { content: t } }] });
+  const usageChunk = { choices: [], usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 } };
+
+  function streamingClient(config: Partial<SignalVaultConfig> = {}) {
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake', ...config });
+    const sent: any[] = [];
+    (client as any).openai = {
+      chat: {
+        completions: {
+          create: async (p: any) => {
+            sent.push(p);
+            const withUsage = p.stream_options?.include_usage === true;
+            return (async function* () {
+              yield content('Hel');
+              yield content('lo');
+              if (withUsage) yield usageChunk;
+            })();
+          },
+        },
+      },
+    };
+    return { client, sent };
+  }
+
+  async function collect(stream: AsyncIterable<any>) {
+    const out: any[] = [];
+    for await (const chunk of stream) out.push(chunk);
+    return out;
+  }
+
+  it.each([false, true])(
+    'requests usage, hides the usage-only chunk, and records the tokens (mirrorMode: %s)',
+    async (mirrorMode) => {
+      const f = stubFetch({ 'ai.request': [allow] });
+      const { client, sent } = streamingClient({ mirrorMode });
+      const params = { model: 'm', messages, stream: true as const };
+
+      const chunks = await collect(await client.chat.completions.create(params));
+      await client.flush();
+
+      expect(sent[0].stream_options).toEqual({ include_usage: true });
+      expect(params).toEqual({ model: 'm', messages, stream: true }); // caller's object untouched
+      expect(chunks).toHaveLength(2);
+      expect(chunks.every((c) => c.choices[0].delta)).toBe(true);
+      const response = f.calls.find((c) => c.body.type === 'ai.response')!.body;
+      expect(response.payload.output).toBe('Hello');
+      expect(response.payload.usage).toEqual({ prompt_tokens: 7, completion_tokens: 2 });
+    }
+  );
+
+  it('passes the usage chunk through when the caller asked for it', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client } = streamingClient();
+    const chunks = await collect(
+      await client.chat.completions.create({
+        model: 'm', messages, stream: true, stream_options: { include_usage: true },
+      })
+    );
+    expect(chunks).toHaveLength(3);
+    expect(chunks[2]).toEqual(usageChunk);
+  });
+
+  it('keeps the caller\'s other stream_options when adding include_usage', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = streamingClient();
+    await collect(
+      await client.chat.completions.create({
+        model: 'm', messages, stream: true, stream_options: { include_obfuscation: false } as any,
+      })
+    );
+    expect(sent[0].stream_options).toEqual({ include_obfuscation: false, include_usage: true });
+  });
+
+  it('stream_options: null removes the key entirely (for servers that reject it)', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = streamingClient();
+    const chunks = await collect(
+      await client.chat.completions.create({ model: 'm', messages, stream: true, stream_options: null })
+    );
+    expect('stream_options' in sent[0]).toBe(false);
+    expect(chunks).toHaveLength(2);
+  });
+
+  it('hides an injected usage chunk that has no choices key at all', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    (client as any).openai = {
+      chat: {
+        completions: {
+          create: async () =>
+            (async function* () {
+              yield content('Hi');
+              yield { usage: { prompt_tokens: 1, completion_tokens: 1 } };
+            })(),
+        },
+      },
+    };
+    const chunks = await collect(await client.chat.completions.create({ model: 'm', messages, stream: true }));
+    expect(chunks).toHaveLength(1);
+  });
+
+  it('respects an explicit include_usage: false', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = streamingClient();
+    await collect(
+      await client.chat.completions.create({
+        model: 'm', messages, stream: true, stream_options: { include_usage: false },
+      })
+    );
+    await client.flush();
+    expect(sent[0].stream_options).toEqual({ include_usage: false });
+    expect(f.calls.find((c) => c.body.type === 'ai.response')!.body.payload.usage).toEqual({
+      prompt_tokens: 0, completion_tokens: 0,
+    });
+  });
+
+  it('does not add stream_options to non-streaming requests', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client, openai } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    expect(openai.sent[0].stream_options).toBeUndefined();
+  });
+});
+
+describe('ESM entry point', () => {
+  it('re-exports every runtime export of the CommonJS build', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../esm/index.mjs'), 'utf8');
+    const block = src.match(/export \{([^}]*)\} from '\.\/index\.js'/);
+    const esmNames = block![1].split(',').map((n) => n.trim()).filter(Boolean).sort();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const cjsNames = Object.keys(require('../index')).filter((k) => k !== 'default' && k !== '__esModule').sort();
+    expect(esmNames).toEqual(cjsNames);
+  });
+});

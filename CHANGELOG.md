@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — 2026-09-29
+
+Packaging and compatibility release.
+
+### Breaking changes
+
+- **Package entry points are now defined by an `exports` map.** Only `@signalvaultio/node` and `@signalvaultio/node/package.json` can be imported. Deep imports such as `@signalvaultio/node/dist/index.js` or `@signalvaultio/node/dist/tools` no longer resolve; import from the package root instead. This is why this release is a minor version bump.
+- **Under native ESM, the default import is now the client class.** In 0.4.0 it was the whole CommonJS `module.exports` object, so these workarounds stop working: `const { SignalVaultClient } = pkg`, `new pkg.default(...)`, and `pkg.SignalVaultBlockedError` / `pkg.SignalVaultUnavailableError` (an `instanceof` check against `undefined` throws a `TypeError`, and only when a request is actually blocked). Use `import SignalVaultClient from '@signalvaultio/node'`, or named imports: `import { SignalVaultClient, SignalVaultBlockedError } from '@signalvaultio/node'`. The same applies to `(await import('@signalvaultio/node')).default` from CommonJS. `require()` is unchanged.
+
+### Fixes
+
+- **Default import under native ESM.** `import SignalVaultClient from '@signalvaultio/node'` failed with "SignalVaultClient is not a constructor", because ESM received the whole CommonJS `module.exports` object. The package now has an ESM entry point, so the default import and named imports both work under native ESM, CommonJS `require()`, TypeScript (`node16` and `bundler` resolution) and bundlers. ESM and CommonJS share one copy of the SDK, so `withContext` works across both.
+- **`openai` is no longer required at runtime for Anthropic-only use.** It was loaded at startup, so an install without `openai` failed with "Cannot find module 'openai'". Both provider SDKs are now loaded only when their API key is configured. Errors other than a missing package are no longer reported as "not installed". TypeScript projects without `openai` still need `skipLibCheck: true` (the default in most setups), because the type declarations refer to openai's types.
+- **Token usage for OpenAI streams.** Streamed OpenAI requests were logged with zero tokens and zero cost. The SDK now sets `stream_options: { include_usage: true }` when you have not set `include_usage` yourself, records the usage, and consumes the extra usage-only chunk (empty `choices`) instead of passing it to your code. If you set `include_usage` yourself, your setting is kept and the chunk is passed through as before. If you point the openai SDK at an OpenAI-compatible server that rejects `stream_options`, pass `stream_options: null`: the SDK then sends no `stream_options` at all.
+
+### Compatibility
+
+- **`openai` peer range widened to `^4.4.0 || ^5.0.0 || ^6.0.0 || ^7.0.0`** (was `^4.0.0`). Installing alongside openai 5–7 no longer fails with ERESOLVE. Tested against 4.4.0 and the latest 4.x, 5.x, 6.x and 7.x; 4.0–4.3 work at runtime but lack the types the SDK's declarations use. openai 7 requires Node.js 22+.
+- `@anthropic-ai/sdk` stays `>=0.20.0`, tested against 0.20.0 and the latest release.
+- CI now installs the packed tarball into fresh ESM, CommonJS and TypeScript projects and runs real provider SDK calls against a local mock, across the supported provider versions, and re-runs weekly against the latest provider releases.
+
 ## 0.4.0 — 2026-09-28
 
 Security and reliability release.
