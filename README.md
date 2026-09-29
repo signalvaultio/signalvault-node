@@ -20,6 +20,18 @@ npm install @signalvaultio/node @anthropic-ai/sdk
 npm install @signalvaultio/node openai @anthropic-ai/sdk
 ```
 
+Supported provider SDKs: `openai` 4.4 through 7.x (openai 7 needs Node.js 22+) and `@anthropic-ai/sdk` 0.20 or later. Install only the one you use; the other is optional.
+
+The package works with both `import` and `require()`:
+
+```typescript
+import SignalVaultClient from '@signalvaultio/node';          // ESM, TypeScript
+import { SignalVaultClient } from '@signalvaultio/node';      // also works
+const { SignalVaultClient } = require('@signalvaultio/node'); // CommonJS
+```
+
+Server-side bundlers (webpack, esbuild) are supported. esbuild's ESM output needs its usual `createRequire` banner for CommonJS dependencies: `--banner:js="import { createRequire } from 'module'; const require = createRequire(import.meta.url);"`.
+
 ## Quick Start — OpenAI
 
 ```typescript
@@ -28,8 +40,6 @@ import SignalVaultClient from '@signalvaultio/node';
 const client = new SignalVaultClient({
   apiKey: 'sk_live_your_signalvault_key',
   openaiApiKey: process.env.OPENAI_API_KEY!,
-  baseUrl: 'https://api.signalvault.io',
-  environment: 'production',
 });
 
 // Use exactly like OpenAI SDK
@@ -91,7 +101,7 @@ for await (const event of stream) {
 }
 ```
 
-For token counts on OpenAI streams, pass `stream_options: { include_usage: true }`. The SDK does not add it for you, because OpenAI then sends a final chunk with an empty `choices` array.
+For OpenAI streams, the SDK sets `stream_options: { include_usage: true }` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and has an empty `choices` array; the SDK consumes that chunk rather than passing it to you, so `chunk.choices[0].delta` is safe on every chunk you receive. If you set `stream_options.include_usage` yourself, your setting is kept: with `true` you receive the usage chunk as usual, with `false` the response is logged without token counts.
 
 ## Agent Tool-Use Capture
 
@@ -251,7 +261,19 @@ const client = new SignalVaultClient({
 });
 ```
 
+`environment` does not choose which rules apply: SignalVault uses the environment of the API key you pass as `apiKey`. Use a key created for the environment you want.
+
 ## Error Handling
+
+When a guardrail rule blocks a request, `create()` throws `SignalVaultBlockedError` and the provider is never called. It carries:
+
+- `violations` — the rules that matched, each with `rule_id`, `type` (for example `contains_secret`), `severity`, `action` and `details`
+- `requestId` — the ID the SDK sent to SignalVault as `request_id` for this request
+- `dashboardUrl` — a link to the blocked request, when the API provides one
+
+The message lists only the violation types, never the matched content.
+
+`SignalVaultUnavailableError` (with `requestId` and the HTTP `status`, if any) is thrown only with `failMode: 'closed'`, when no decision could be obtained.
 
 ```typescript
 import { SignalVaultBlockedError, SignalVaultUnavailableError } from '@signalvaultio/node';

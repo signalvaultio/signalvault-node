@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import OpenAI from 'openai';
+import type OpenAI from 'openai';
 import {
   ToolRecordOptions,
   ToolsAPI,
@@ -13,7 +13,7 @@ import {
 export type { ToolRecordOptions, ToolsAPI } from './tools';
 
 /** Kept in sync with package.json by a unit test. */
-export const SDK_VERSION = '0.4.0';
+export const SDK_VERSION = '0.5.0';
 
 const DEFAULT_BASE_URL = 'https://api.signalvault.io';
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
@@ -250,6 +250,71 @@ function parseRetryAfterMs(response?: Response): number | null {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * The provider SDKs are optional peers, loaded only when their API key is
+ * configured, so installing just the one you use is enough. The requires are
+ * literal strings inside try blocks on purpose: bundlers can only follow a
+ * literal require, and treat one inside a try as optional.
+ */
+function loadOpenAI(apiKey: string): any {
+  let mod: any;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    mod = require('openai');
+  } catch (error) {
+    throw notInstalled(error, 'openai');
+  }
+  return construct(mod, apiKey);
+}
+
+function loadAnthropic(apiKey: string): any {
+  let mod: any;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    mod = require('@anthropic-ai/sdk');
+  } catch (error) {
+    throw notInstalled(error, '@anthropic-ai/sdk');
+  }
+  return construct(mod, apiKey);
+}
+
+function construct(mod: any, apiKey: string): any {
+  const Client = mod.default ?? mod;
+  return new Client({ apiKey });
+}
+
+/**
+ * Only a missing package is reported as "not installed"; anything else (a
+ * broken install, a missing transitive dependency) is returned unchanged.
+ */
+function notInstalled(error: unknown, pkg: string): unknown {
+  // Read fields directly: `instanceof Error` fails across realms (e.g. under Jest).
+  const { code, message } = (error ?? {}) as { code?: unknown; message?: unknown };
+  if (code === 'MODULE_NOT_FOUND' && String(message).includes(`'${pkg}'`)) {
+    return new Error(`[SignalVault] ${pkg} is not installed. Run: npm install ${pkg}`);
+  }
+  return error;
+}
+
+/**
+ * Asks OpenAI to report token usage on a stream, unless the caller already
+ * decided either way. OpenAI then sends one extra final chunk with an empty
+ * `choices` array; `injected` tells the stream wrapper to consume that chunk
+ * instead of passing it to a caller who never asked for it.
+ */
+function withStreamUsage(
+  params: OpenAI.Chat.ChatCompletionCreateParams
+): { params: OpenAI.Chat.ChatCompletionCreateParams; injected: boolean } {
+  const options = (params as { stream_options?: { include_usage?: boolean } | null }).stream_options;
+  if (!params.stream || (options && options.include_usage !== undefined)) {
+    return { params, injected: false };
+  }
+  return {
+    params: { ...params, stream_options: { ...(options ?? {}), include_usage: true } } as typeof params,
+    injected: true,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // SignalVaultClient
 // ---------------------------------------------------------------------------
@@ -311,24 +376,8 @@ export class SignalVaultClient {
     this.bgTimeout = config.timeout ?? 10000;
     this.defaultMetadata = config.metadata ?? {};
 
-    this.openai = config.openaiApiKey
-      ? new OpenAI({ apiKey: config.openaiApiKey })
-      : null;
-
-    if (config.anthropicApiKey) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const mod = require('@anthropic-ai/sdk');
-        const Anthropic = mod.default ?? mod;
-        this.anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
-      } catch {
-        throw new Error(
-          '[SignalVault] @anthropic-ai/sdk is not installed. Run: npm install @anthropic-ai/sdk'
-        );
-      }
-    } else {
-      this.anthropic = null;
-    }
+    this.openai = config.openaiApiKey ? loadOpenAI(config.openaiApiKey) : null;
+    this.anthropic = config.anthropicApiKey ? loadAnthropic(config.anthropicApiKey) : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -601,12 +650,13 @@ export class SignalVaultClient {
     params: OpenAI.Chat.ChatCompletionCreateParams,
     metadata: Record<string, unknown>
   ) {
-    const response = await this.openai!.chat.completions.create(params as any);
+    const usage = withStreamUsage(params);
+    const response = await this.openai!.chat.completions.create(usage.params as any);
     const model = params.model as string;
     const messages = params.messages as unknown[];
 
     if (params.stream) {
-      return this.wrapStream(response as any, (output, promptTokens, completionTokens) =>
+      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
         this.sendAuditEvents(
           requestId, model, messages, output, promptTokens, completionTokens, metadata, 'openai'
         )
@@ -640,10 +690,11 @@ export class SignalVaultClient {
     const decision = await this.enforce(requestId, model, messages, metadata, 'openai');
     const fallback = this.fallbackRequest(decision, requestId, model, messages, metadata, 'openai');
 
-    const response = await this.openai!.chat.completions.create(params as any);
+    const usage = withStreamUsage(params);
+    const response = await this.openai!.chat.completions.create(usage.params as any);
 
     if (params.stream) {
-      return this.wrapStream(response as any, (output, promptTokens, completionTokens) =>
+      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
         this.sendResponseEvent(
           requestId, model, output, promptTokens, completionTokens, metadata, 'openai', fallback
         )
@@ -736,10 +787,13 @@ export class SignalVaultClient {
   /**
    * Yields chunks through unchanged and records the response when the stream
    * ends — including when the consumer breaks out early or the stream throws,
-   * in which case the partial output is recorded.
+   * in which case the partial output is recorded. When the SDK added
+   * `include_usage` itself (`hideUsageChunk`), the usage-only final chunk is
+   * consumed here rather than passed on.
    */
   private async *wrapStream(
     stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>,
+    hideUsageChunk: boolean,
     onComplete: (output: string, promptTokens: number, completionTokens: number) => Promise<void>
   ) {
     const chunks: string[] = [];
@@ -753,6 +807,7 @@ export class SignalVaultClient {
         if (chunk.usage) {
           promptTokens = chunk.usage.prompt_tokens || 0;
           completionTokens = chunk.usage.completion_tokens || 0;
+          if (hideUsageChunk && Array.isArray(chunk.choices) && chunk.choices.length === 0) continue;
         }
         yield chunk;
       }

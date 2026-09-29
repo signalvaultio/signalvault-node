@@ -1,16 +1,29 @@
 {
   "name": "@signalvaultio/node",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "SignalVault SDK - AI audit logs and guardrails for safe production AI",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "!dist/__tests__",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "prepublishOnly": "npm run build",
     "test": "jest --passWithNoTests"
   },
@@ -41,7 +54,7 @@
   "homepage": "https://signalvault.io/docs",
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.20.0",
-    "openai": "^4.0.0"
+    "openai": "^4.4.0 || ^5.0.0 || ^6.0.0 || ^7.0.0"
   },
   "peerDependenciesMeta": {
     "openai": {

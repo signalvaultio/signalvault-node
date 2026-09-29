@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a new openai / @anthropic-ai/sdk release that breaks the
+  # wrapper is caught before users hit it.
+  schedule:
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -39,3 +43,31 @@ jobs:
           node-version: 24
       # Only runtime dependencies ship to users.
       - run: npm audit --omit=dev --audit-level=moderate
+
+  # Packs the SDK and installs the tarball into fresh ESM, CommonJS and
+  # TypeScript projects, then runs real provider SDK calls against a local
+  # mock. Covers the lowest and highest supported provider versions.
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { node: 20, openai: '4.4.0', anthropic: '0.20.0' }
+          - { node: 20, openai: '4', anthropic: 'latest' }
+          - { node: 22, openai: '5', anthropic: 'latest' }
+          - { node: 22, openai: '6', anthropic: 'latest' }
+          - { node: 24, openai: '7', anthropic: 'latest' } # openai 7 needs Node 22+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: node scripts/test-package.mjs
+        env:
+          OPENAI_VERSION: ${{ matrix.openai }}
+          ANTHROPIC_VERSION: ${{ matrix.anthropic }}
