@@ -20,7 +20,7 @@ npm install @signalvaultio/node @anthropic-ai/sdk
 npm install @signalvaultio/node openai @anthropic-ai/sdk
 ```
 
-Supported provider SDKs: `openai` 4.4 through 7.x (openai 7 needs Node.js 22+) and `@anthropic-ai/sdk` 0.20 or later. Install only the one you use; the other is optional.
+Supported provider SDKs: `openai` 4.4 through 7.x (openai 7 needs Node.js 22+) and `@anthropic-ai/sdk` 0.20 or later. Install only the one you use; the other is optional. TypeScript projects without `openai` need `skipLibCheck: true` (the default in most setups), because the SDK's type declarations refer to openai's types.
 
 The package works with both `import` and `require()`:
 
@@ -101,7 +101,7 @@ for await (const event of stream) {
 }
 ```
 
-For OpenAI streams, the SDK sets `stream_options: { include_usage: true }` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and has an empty `choices` array; the SDK consumes that chunk rather than passing it to you, so `chunk.choices[0].delta` is safe on every chunk you receive. If you set `stream_options.include_usage` yourself, your setting is kept: with `true` you receive the usage chunk as usual, with `false` the response is logged without token counts.
+For OpenAI streams, the SDK sets `stream_options: { include_usage: true }` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and no choices; the SDK consumes that chunk rather than passing it to you, so the stream you receive looks the same as without usage reporting. If you set `stream_options.include_usage` yourself, your setting is kept: with `true` you receive the usage chunk as usual, with `false` the response is logged without token counts. If your OpenAI-compatible server rejects `stream_options`, pass `stream_options: null` and the SDK sends none.
 
 ## Agent Tool-Use Capture
 

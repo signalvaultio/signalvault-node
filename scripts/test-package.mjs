@@ -14,7 +14,7 @@
 //   - real provider SDK calls (streaming and not) against a local mock of
 //     OpenAI, Anthropic and SignalVault, asserting what gets audited
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -29,7 +29,9 @@ const work = mkdtempSync(join(tmpdir(), 'sv-package-'));
 const npm = 'npm'; // POSIX only (CI runs on Linux)
 
 function run(cmd, args, cwd, env = {}) {
-  execFileSync(cmd, args, { cwd, stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, ...env } });
+  execFileSync(cmd, args, {
+    cwd, stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, ...env }, timeout: 10 * 60_000,
+  });
 }
 
 function project(name, deps, type = 'module') {
@@ -55,7 +57,13 @@ const server = createServer((req, res) => {
   let raw = '';
   req.on('data', (c) => (raw += c));
   req.on('end', () => {
-    const body = raw ? JSON.parse(raw) : {};
+    let body;
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      res.writeHead(400).end('invalid JSON');
+      return;
+    }
     const json = (status, data) => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(data));
@@ -71,7 +79,7 @@ const server = createServer((req, res) => {
       if (!body.stream) {
         return json(200, {
           id: 'c1', object: 'chat.completion', created: 0, model: body.model,
-          choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Hello' } }],
+          choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Hello there' } }],
           usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
         });
       }
@@ -86,11 +94,14 @@ const server = createServer((req, res) => {
     }
 
     if (req.url === '/anthropic/v1/messages') {
+      // The client authenticates with x-api-key; a Bearer token here would mean
+      // a credential from the developer's shell (ANTHROPIC_AUTH_TOKEN) leaked in.
+      if (req.headers.authorization) return json(400, { error: 'unexpected Authorization header' });
       const message = { id: 'm1', type: 'message', role: 'assistant', model: body.model, stop_sequence: null };
       if (!body.stream) {
         return json(200, {
           ...message, stop_reason: 'end_turn',
-          content: [{ type: 'text', text: 'Hi' }],
+          content: [{ type: 'text', text: 'Hi there' }],
           usage: { input_tokens: 4, output_tokens: 1 },
         });
       }
@@ -120,6 +131,11 @@ const requireHere = svCreateRequire(process.cwd() + '/');
 // SignalVault client has loaded the provider itself (the path under test), its
 // provider client is swapped for one pointed at the mock.
 function pointAtMock(client, field, pkg, path) {
+  // If the SDK renames or hides this field, the swap would silently do nothing
+  // and the provider client would keep its real default host.
+  if (!Object.prototype.hasOwnProperty.call(client, field) || !client[field]) {
+    throw new Error('pointAtMock: SignalVaultClient has no provider client at .' + field);
+  }
   const mod = requireHere(pkg);
   const Provider = mod.default ?? mod;
   client[field] = new Provider({ apiKey: 'sk-fake', baseURL: base + path });
@@ -131,12 +147,17 @@ function check(label, cond, detail) {
   else console.log('ok  ', label);
 }
 async function collect(stream) { const out = []; for await (const c of stream) out.push(c); return out; }
+// A scenario whose promise never settles would otherwise exit 0 with checks skipped.
+let finished = false;
+process.on('exit', (code) => {
+  if (!finished && code === 0) { console.error('FAIL scenario did not run to completion'); process.exitCode = 1; }
+});
 
 async function openaiScenario(Client, tag) {
   const client = new Client({ apiKey: 'sk_test', openaiApiKey: 'sk-fake', baseUrl: base });
   pointAtMock(client, 'openai', 'openai', '/openai/v1');
   const res = await client.chat.completions.create({ model: 'gpt-x', messages });
-  check(tag + ' openai response', res.choices[0].message.content === 'Hello', res);
+  check(tag + ' openai response', res.choices[0].message.content === 'Hello there', res);
   const chunks = await collect(await client.chat.completions.create({ model: 'gpt-x', messages, stream: true }));
   check(tag + ' openai stream: caller sees no usage-only chunk', chunks.length === 2 && chunks.every((c) => c.choices[0].delta), chunks);
   await client.flush();
@@ -144,14 +165,16 @@ async function openaiScenario(Client, tag) {
   check(tag + ' openai usage recorded (non-streaming, streaming)',
     responses.length === 2 && responses.every((r) => r.payload.usage.prompt_tokens === 3 && r.payload.usage.completion_tokens === 2),
     responses.map((r) => r.payload));
-  check(tag + ' openai stream output recorded', responses[1]?.payload.output === 'Hello', responses[1]?.payload);
+  const outputs = responses.map((r) => r.payload.output).sort();
+  check(tag + ' openai output recorded (non-streaming, streaming)',
+    JSON.stringify(outputs) === JSON.stringify(['Hello', 'Hello there']), outputs);
 }
 
 async function anthropicScenario(Client, tag) {
   const client = new Client({ apiKey: 'sk_test', anthropicApiKey: 'sk-ant-fake', baseUrl: base });
   pointAtMock(client, 'anthropic', '@anthropic-ai/sdk', '/anthropic');
   const res = await client.messages.create({ model: 'claude-x', max_tokens: 5, system: 'be brief', messages });
-  check(tag + ' anthropic response', res.content[0].text === 'Hi', res);
+  check(tag + ' anthropic response', res.content[0].text === 'Hi there', res);
   const events = await collect(await client.messages.create({ model: 'claude-x', max_tokens: 5, messages, stream: true }));
   check(tag + ' anthropic stream events', events.some((e) => e.type === 'message_stop'), events.map((e) => e.type));
   await client.flush();
@@ -162,6 +185,9 @@ async function anthropicScenario(Client, tag) {
   check(tag + ' anthropic usage sent as prompt_tokens/completion_tokens',
     responses.length === 2 && responses.every((r) => r.payload.usage.prompt_tokens === 4 && r.payload.usage.completion_tokens === 1),
     responses.map((r) => r.payload.usage));
+  const outputs = responses.map((r) => r.payload.output).sort();
+  check(tag + ' anthropic output recorded (non-streaming, streaming)',
+    JSON.stringify(outputs) === JSON.stringify(['Hi', 'Hi there']), outputs);
 }
 `;
 
@@ -181,6 +207,7 @@ ${withOpenAI ? "await openaiScenario(SignalVaultClient, 'esm');" : `
 try { new SignalVaultClient({ apiKey: 'k', openaiApiKey: 'x' }); check('missing openai reported', false); }
 catch (e) { check('missing openai reported clearly', /openai is not installed/.test(e.message), e.message); }`}
 await anthropicScenario(Named, 'esm');
+finished = true;
 `;
 
 const cjsTest = (withOpenAI) => `
@@ -191,7 +218,10 @@ ${scenario}
   check('cjs require default', typeof sv.default === 'function' && sv.default === sv.SignalVaultClient);
   ${withOpenAI ? "await openaiScenario(sv.SignalVaultClient, 'cjs');" : ''}
   await anthropicScenario(sv.default, 'cjs');
-})();
+})().then(
+  () => { finished = true; },
+  (error) => { console.error('FAIL', error); process.exitCode = 1; }
+);
 `;
 
 const tsConsumer = (importLine) => `
@@ -273,12 +303,30 @@ dns.lookup = function (host, ...rest) {
 };
 `;
 
+// Consumer processes get the parent environment minus anything that could
+// change where provider SDKs connect or what they send: provider settings
+// (OPENAI_*, ANTHROPIC_* — e.g. ANTHROPIC_AUTH_TOKEN would be sent as a
+// header), proxy settings (a proxy would bypass the DNS guard) and
+// NODE_OPTIONS.
+const UNSAFE_ENV = /^(OPENAI_|ANTHROPIC_)|_PROXY$|^NODE_USE_ENV_PROXY$|^NODE_OPTIONS$/i;
+const consumerEnv = (extra) => ({
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !UNSAFE_ENV.test(key))),
+  ...extra,
+});
+
 async function runNode(file, cwd, env) {
   const guard = join(cwd, 'network-guard.cjs');
   writeFileSync(guard, networkGuard);
   await new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, ['--require', guard, file], { cwd, stdio: 'inherit', env: { ...process.env, ...env } });
-    child.on('exit', (code) => (code === 0 ? resolveRun() : reject(new Error(`${file} in ${cwd} exited ${code}`))));
+    const child = spawn(process.execPath, ['--require', guard, file], { cwd, stdio: 'inherit', env: consumerEnv(env) });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`${file} in ${cwd} timed out`));
+    }, 120_000);
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      code === 0 ? resolveRun() : reject(new Error(`${file} in ${cwd} exited ${code}`));
+    });
   });
 }
 
@@ -286,7 +334,6 @@ try {
   run(npm, ['run', 'build', '--silent'], root);
   const packed = JSON.parse(execFileSync(npm, ['pack', '--json', '--pack-destination', work], { cwd: root }).toString());
   const tarball = join(work, packed[0].filename);
-  const typescript = JSON.parse(readFileSync(join(root, 'node_modules/typescript/package.json'), 'utf8')).version;
   console.log(`\npackage: ${packed[0].filename}  openai@${openaiVersion}  @anthropic-ai/sdk@${anthropicVersion}\n`);
 
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -299,7 +346,7 @@ try {
 
   // Full install: both providers, runtime + TypeScript checks.
   const full = project('full', [
-    tarball, `openai@${openaiVersion}`, `@anthropic-ai/sdk@${anthropicVersion}`, '@types/node@20', `typescript@${typescript}`,
+    tarball, `openai@${openaiVersion}`, `@anthropic-ai/sdk@${anthropicVersion}`, '@types/node@20',
     'esbuild@0', 'webpack@5', 'webpack-cli@6',
   ]);
   writeFileSync(join(full, 'esm.mjs'), esmTest(true));
@@ -333,6 +380,22 @@ try {
   await runNode('esm.mjs', anthropicOnly, env);
   await runNode('cjs.cjs', anthropicOnly, env);
   await bundle(anthropicOnly, false, ['webpack']);
+  // Without openai installed, the SDK's declarations can't resolve openai's
+  // types, so this documents and checks the supported setup: skipLibCheck.
+  writeFileSync(join(anthropicOnly, 'consumer.mts'), `
+import SignalVaultClient, { SignalVaultBlockedError } from '@signalvaultio/node';
+const client: SignalVaultClient = new SignalVaultClient({ apiKey: 'k', anthropicApiKey: 'y' });
+export async function use(): Promise<void> {
+  try { await client.flush(); } catch (e) { if (e instanceof SignalVaultBlockedError) void e.violations; }
+}
+`);
+  writeFileSync(join(anthropicOnly, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: { strict: true, noEmit: true, skipLibCheck: true, types: [], lib: ['ES2022', 'DOM'],
+      target: 'ES2022', module: 'node16', moduleResolution: 'node16' },
+    files: ['consumer.mts'],
+  }));
+  run(process.execPath, [tsc, '-p', 'tsconfig.json'], anthropicOnly);
+  console.log('ok   typescript anthropic-only (skipLibCheck)');
 
   console.log('\npackage test passed');
 } catch (error) {

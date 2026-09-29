@@ -49,6 +49,7 @@ jobs:
   # mock. Covers the lowest and highest supported provider versions.
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

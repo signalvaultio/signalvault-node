@@ -2,6 +2,7 @@
   "name": "@signalvaultio/node",
   "version": "0.5.0",
   "description": "SignalVault SDK - AI audit logs and guardrails for safe production AI",
+  "type": "commonjs",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

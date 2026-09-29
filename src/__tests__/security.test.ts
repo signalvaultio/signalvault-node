@@ -531,7 +531,46 @@ describe('OpenAI streaming usage', () => {
     expect(chunks[2]).toEqual(usageChunk);
   });
 
-  it('respects an explicit include_usage: false and keeps other stream_options', async () => {
+  it('keeps the caller\'s other stream_options when adding include_usage', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = streamingClient();
+    await collect(
+      await client.chat.completions.create({
+        model: 'm', messages, stream: true, stream_options: { include_obfuscation: false } as any,
+      })
+    );
+    expect(sent[0].stream_options).toEqual({ include_obfuscation: false, include_usage: true });
+  });
+
+  it('stream_options: null removes the key entirely (for servers that reject it)', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const { client, sent } = streamingClient();
+    const chunks = await collect(
+      await client.chat.completions.create({ model: 'm', messages, stream: true, stream_options: null })
+    );
+    expect('stream_options' in sent[0]).toBe(false);
+    expect(chunks).toHaveLength(2);
+  });
+
+  it('hides an injected usage chunk that has no choices key at all', async () => {
+    stubFetch({ 'ai.request': [allow] });
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    (client as any).openai = {
+      chat: {
+        completions: {
+          create: async () =>
+            (async function* () {
+              yield content('Hi');
+              yield { usage: { prompt_tokens: 1, completion_tokens: 1 } };
+            })(),
+        },
+      },
+    };
+    const chunks = await collect(await client.chat.completions.create({ model: 'm', messages, stream: true }));
+    expect(chunks).toHaveLength(1);
+  });
+
+  it('respects an explicit include_usage: false', async () => {
     const f = stubFetch({ 'ai.request': [allow] });
     const { client, sent } = streamingClient();
     await collect(
@@ -551,5 +590,16 @@ describe('OpenAI streaming usage', () => {
     const { client, openai } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
     expect(openai.sent[0].stream_options).toBeUndefined();
+  });
+});
+
+describe('ESM entry point', () => {
+  it('re-exports every runtime export of the CommonJS build', () => {
+    const src = fs.readFileSync(path.join(__dirname, '../esm/index.mjs'), 'utf8');
+    const block = src.match(/export \{([^}]*)\} from '\.\/index\.js'/);
+    const esmNames = block![1].split(',').map((n) => n.trim()).filter(Boolean).sort();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const cjsNames = Object.keys(require('../index')).filter((k) => k !== 'default' && k !== '__esModule').sort();
+    expect(esmNames).toEqual(cjsNames);
   });
 });

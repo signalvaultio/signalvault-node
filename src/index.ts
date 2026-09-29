@@ -301,12 +301,21 @@ function notInstalled(error: unknown, pkg: string): unknown {
  * decided either way. OpenAI then sends one extra final chunk with an empty
  * `choices` array; `injected` tells the stream wrapper to consume that chunk
  * instead of passing it to a caller who never asked for it.
+ *
+ * `stream_options: null` opts out entirely: the key is removed, for
+ * OpenAI-compatible servers that reject `stream_options`. (The OpenAI API
+ * treats null and absent the same.)
  */
 function withStreamUsage(
   params: OpenAI.Chat.ChatCompletionCreateParams
 ): { params: OpenAI.Chat.ChatCompletionCreateParams; injected: boolean } {
+  if (!params.stream) return { params, injected: false };
   const options = (params as { stream_options?: { include_usage?: boolean } | null }).stream_options;
-  if (!params.stream || (options && options.include_usage !== undefined)) {
+  if (options === null) {
+    const { stream_options: _omitted, ...rest } = params as typeof params & { stream_options?: unknown };
+    return { params: rest as typeof params, injected: false };
+  }
+  if (options && options.include_usage !== undefined) {
     return { params, injected: false };
   }
   return {
@@ -807,7 +816,8 @@ export class SignalVaultClient {
         if (chunk.usage) {
           promptTokens = chunk.usage.prompt_tokens || 0;
           completionTokens = chunk.usage.completion_tokens || 0;
-          if (hideUsageChunk && Array.isArray(chunk.choices) && chunk.choices.length === 0) continue;
+          // Missing or empty `choices`: the usage-only chunk the caller didn't ask for.
+          if (hideUsageChunk && !chunk.choices?.length) continue;
         }
         yield chunk;
       }
