@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 — 2026-10-14
+
+Security fix for invalid API keys and base URLs.
 
 ### Security
 
