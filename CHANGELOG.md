@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **Invalid `apiKey` or `baseUrl` no longer turns guardrails off.** Each of these made every request to SignalVault fail before it was sent: an `apiKey` containing a line break, a control character or a character above U+00FF; a `baseUrl` with `user:password@`. With the default `failMode: 'open'`, every call then went to the provider without a guardrail check or an audit event, and the warning said the API was unreachable. A missing `apiKey` was sent as `Bearer undefined`. The constructor now strips surrounding whitespace from `apiKey`. It throws if the key is not a string, is empty, or contains whitespace, control or non-ASCII characters, and if `baseUrl` contains credentials. (GHSA-h7g7-7984-xjhm)
+- **Debug output no longer shows the API key.** With `debug: true`, the raw fetch error was logged, and for an invalid key it quoted the `Authorization` header. Errors are now logged as one line with their causes and without the key. `baseUrl` errors no longer quote the URL you passed, which could contain credentials. (GHSA-h7g7-7984-xjhm)
+
 ## 0.5.0 — 2026-09-29
 
 Packaging and compatibility release.
