@@ -90,6 +90,84 @@ describe('baseUrl', () => {
     expect(() => normalizeBaseUrl('api.signalvault.io')).toThrow(/not a valid URL/);
     expect(() => normalizeBaseUrl('ftp://api.signalvault.io')).toThrow(/https/);
   });
+
+  it('refuses credentials in the URL', () => {
+    // fetch refuses such URLs, which failMode 'open' used to turn into "allow".
+    expect(() => makeClient({ baseUrl: 'https://user:hunter2@api.signalvault.io' })).toThrow(/credentials/);
+    expect(() => makeClient({ baseUrl: 'https://token@api.signalvault.io' })).toThrow(/credentials/);
+  });
+
+  it('never quotes the URL in errors', () => {
+    for (const bad of ['hunter2', 'https://api.signalvault.io?key=hunter2', 'https://u:hunter2@api.signalvault.io']) {
+      expect(() => normalizeBaseUrl(bad)).toThrow();
+      try {
+        normalizeBaseUrl(bad);
+      } catch (e) {
+        expect((e as Error).message).not.toContain('hunter2');
+      }
+    }
+  });
+});
+
+describe('apiKey', () => {
+  const block = {
+    status: 200,
+    body: {
+      decision: 'block',
+      violations: [{ rule_id: 'r1', type: 'contains_secret', severity: 9, action: 'block', details: {} }],
+      redactions: [],
+    },
+  };
+
+  it.each(['sk_test_abc\n', 'sk_test_abc\r\n', '  sk_test_abc ', '\tsk_test_abc', '﻿sk_test_abc'])(
+    'strips surrounding whitespace and enforces a block (%j)',
+    async (raw) => {
+      // A key read from a file used to make every pre-flight fail locally,
+      // which failMode 'open' turned into "allow".
+      const f = stubFetch({ 'ai.request': [block] });
+      const { client, openai } = makeClient({ apiKey: raw });
+      await expect(client.chat.completions.create({ model: 'm', messages })).rejects.toBeInstanceOf(
+        SignalVaultBlockedError
+      );
+      expect((f.calls[0].init.headers as Record<string, string>).Authorization).toBe('Bearer sk_test_abc');
+      expect(openai.sent).toHaveLength(0);
+    }
+  );
+
+  it.each([
+    ['', /empty/],
+    [' \n', /empty/],
+    ['sk_test abc_SECRET', /whitespace/],
+    ['sk_test\nabc_SECRET', /whitespace/],
+    ['sk_test\u0000abc_SECRET', /control/],
+    ['sk_test_abc_SECRETé', /non-ASCII/],
+  ])('refuses %j without quoting it', (bad, pattern) => {
+    expect(() => makeClient({ apiKey: bad })).toThrow(pattern);
+    try {
+      makeClient({ apiKey: bad });
+    } catch (e) {
+      expect((e as Error).message).not.toContain('SECRET');
+    }
+  });
+
+  it('refuses a missing key', () => {
+    expect(() => makeClient({ apiKey: undefined as unknown as string })).toThrow(/must be a string, got undefined/);
+  });
+
+  it('keeps the key out of debug output', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    // Shaped like undici's error for an invalid header value.
+    const failure = new TypeError('fetch failed');
+    (failure as any).cause = new Error('bad header "Bearer sk_test_abc"');
+    jest.spyOn(global, 'fetch').mockRejectedValue(failure);
+    const { client } = makeClient({ debug: true });
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    const logged = errorSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+    expect(logged).toContain('Pre-flight failed: TypeError: fetch failed <- Error: bad header "Bearer [redacted]"');
+    expect(logged).not.toContain('sk_test_abc');
+  });
 });
 
 describe('request headers', () => {

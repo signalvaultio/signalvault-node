@@ -52,11 +52,17 @@ function assertNodeEnvironment(): void {
  * `http://` URL would expose both before the server could redirect to HTTPS.
  */
 export function normalizeBaseUrl(raw: string): string {
+  // Errors never quote `raw`: it may contain credentials.
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new Error(`[SignalVault] baseUrl is not a valid URL: ${raw}`);
+    throw new Error('[SignalVault] baseUrl is not a valid URL.');
+  }
+  if (url.username || url.password) {
+    throw new Error(
+      '[SignalVault] baseUrl must not contain credentials (user:password@). Pass the key as apiKey.'
+    );
   }
   if (url.protocol === 'http:' && !LOCAL_HOSTS.has(url.hostname)) {
     throw new Error(
@@ -65,12 +71,53 @@ export function normalizeBaseUrl(raw: string): string {
     );
   }
   if (url.search || url.hash) {
-    throw new Error(`[SignalVault] baseUrl must not contain a query or fragment: ${raw}`);
+    throw new Error('[SignalVault] baseUrl must not contain a query or fragment.');
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
     throw new Error(`[SignalVault] baseUrl must be an https:// URL, got ${url.protocol}`);
   }
   return raw.replace(/\/+$/, '');
+}
+
+/**
+ * Strips surrounding whitespace and refuses keys that can't go in a header.
+ * A key read from a file or a secret often ends in a newline. Sent as is,
+ * every request fails before it leaves the process, so with failMode 'open'
+ * every call would go through unchecked. Errors never include the key.
+ */
+function normalizeApiKey(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    throw new TypeError(`[SignalVault] apiKey must be a string, got ${raw === null ? 'null' : typeof raw}.`);
+  }
+  const key = raw.trim();
+  if (!key) {
+    throw new Error('[SignalVault] apiKey is empty.');
+  }
+  if (/[^\x21-\x7e]/.test(key)) {
+    throw new Error(
+      '[SignalVault] apiKey contains whitespace, control or non-ASCII characters. Check how the key is loaded.'
+    );
+  }
+  return key;
+}
+
+/**
+ * One line describing an error and its causes, for debug output. Never
+ * includes `secret`, and never throws.
+ */
+function describeError(error: unknown, secret: string): string {
+  const parts: string[] = [];
+  let current: any = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 5; depth++) {
+    try {
+      parts.push(current instanceof Error ? `${current.name}: ${current.message}` : String(current));
+      current = current instanceof Error ? (current as any).cause : undefined;
+    } catch {
+      parts.push('<unprintable error>');
+      break;
+    }
+  }
+  return parts.join(' <- ').split(secret).join('[redacted]');
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +422,7 @@ export class SignalVaultClient {
       throw new Error("[SignalVault] failMode must be 'open' or 'closed'.");
     }
 
-    this.svApiKey = config.apiKey;
+    this.svApiKey = normalizeApiKey(config.apiKey);
     this.svBaseUrl = normalizeBaseUrl(config.baseUrl || DEFAULT_BASE_URL);
     this.svEnvironment = config.environment || 'production';
     this.debugMode = config.debug || false;
@@ -426,7 +473,9 @@ export class SignalVaultClient {
   private track(promise: Promise<unknown>): void {
     const tracked = promise
       .catch((err) => {
-        if (this.debugMode) console.error('[SignalVault] Background event failed:', err);
+        if (this.debugMode) {
+          console.error('[SignalVault] Background event failed:', describeError(err, this.svApiKey));
+        }
       })
       .finally(() => this.pending.delete(tracked));
     this.pending.add(tracked);
@@ -1015,7 +1064,9 @@ export class SignalVaultClient {
         retryDelayMs = 250 + Math.random() * 500;
       }
     } catch (error) {
-      if (this.debugMode) console.error('[SignalVault] Event send failed:', error);
+      if (this.debugMode) {
+        console.error('[SignalVault] Event send failed:', describeError(error, this.svApiKey));
+      }
       if (!isTimeout(error)) retryDelayMs = 250 + Math.random() * 500;
     }
 
@@ -1025,7 +1076,9 @@ export class SignalVaultClient {
         result = await this.post(event, this.bgTimeout);
         if (result.ok) return result;
       } catch (error) {
-        if (this.debugMode) console.error('[SignalVault] Event retry failed:', error);
+        if (this.debugMode) {
+          console.error('[SignalVault] Event retry failed:', describeError(error, this.svApiKey));
+        }
       }
     }
 
@@ -1056,7 +1109,9 @@ export class SignalVaultClient {
       );
     } catch (error) {
       const timedOut = isTimeout(error);
-      if (this.debugMode) console.error('[SignalVault] Pre-flight failed:', error);
+      if (this.debugMode) {
+        console.error('[SignalVault] Pre-flight failed:', describeError(error, this.svApiKey));
+      }
       return this.unavailable(
         requestId,
         timedOut ? 'timeout' : 'network',
