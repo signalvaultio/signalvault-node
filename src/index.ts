@@ -288,6 +288,30 @@ function anthropicOutputText(response: any): string {
     .join('');
 }
 
+const ANTHROPIC_USAGE_KEYS = [
+  'input_tokens',
+  'cache_creation_input_tokens',
+  'cache_read_input_tokens',
+  'output_tokens',
+] as const;
+
+/**
+ * Anthropic usage under Anthropic's own names, as the proxy records it. The
+ * server adds the cache counts to `input_tokens`; renamed to `prompt_tokens`,
+ * which for OpenAI already includes cached tokens, they would be lost. Later
+ * sources override earlier ones, but only with a count.
+ */
+function anthropicUsage(...sources: any[]): Record<string, number> {
+  const usage: Record<string, number> = { input_tokens: 0, output_tokens: 0 };
+  for (const source of sources) {
+    for (const key of ANTHROPIC_USAGE_KEYS) {
+      const n = source?.[key];
+      if (typeof n === 'number' && Number.isFinite(n) && n >= 0) usage[key] = n;
+    }
+  }
+  return usage;
+}
+
 function parseRetryAfterMs(response?: Response): number | null {
   const raw = response?.headers?.get?.('retry-after');
   if (!raw) return null;
@@ -716,7 +740,8 @@ export class SignalVaultClient {
     if (params.stream) {
       return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
         this.sendAuditEvents(
-          requestId, model, messages, output, promptTokens, completionTokens, metadata, 'openai'
+          requestId, model, messages, output,
+          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai'
         )
       );
     }
@@ -726,8 +751,10 @@ export class SignalVaultClient {
       this.sendAuditEvents(
         requestId, model, messages,
         completion.choices[0]?.message?.content || '',
-        completion.usage?.prompt_tokens || 0,
-        completion.usage?.completion_tokens || 0,
+        {
+          prompt_tokens: completion.usage?.prompt_tokens || 0,
+          completion_tokens: completion.usage?.completion_tokens || 0,
+        },
         metadata, 'openai'
       )
     );
@@ -754,7 +781,8 @@ export class SignalVaultClient {
     if (params.stream) {
       return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
         this.sendResponseEvent(
-          requestId, model, output, promptTokens, completionTokens, metadata, 'openai', fallback
+          requestId, model, output,
+          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai', fallback
         )
       );
     }
@@ -765,8 +793,10 @@ export class SignalVaultClient {
       this.sendResponseEvent(
         requestId, model,
         completion.choices[0]?.message?.content || '',
-        completion.usage?.prompt_tokens || 0,
-        completion.usage?.completion_tokens || 0,
+        {
+          prompt_tokens: completion.usage?.prompt_tokens || 0,
+          completion_tokens: completion.usage?.completion_tokens || 0,
+        },
         metadata, 'openai', fallback
       )
     );
@@ -786,18 +816,15 @@ export class SignalVaultClient {
     const messages = anthropicMessagesForAudit(params);
 
     if (params.stream) {
-      return this.wrapAnthropicStream(response, (output, inputTokens, outputTokens) =>
-        this.sendAuditEvents(
-          requestId, params.model, messages, output, inputTokens, outputTokens, metadata, 'anthropic'
-        )
+      return this.wrapAnthropicStream(response, (output, usage) =>
+        this.sendAuditEvents(requestId, params.model, messages, output, usage, metadata, 'anthropic')
       );
     }
 
     this.track(
       this.sendAuditEvents(
         requestId, params.model, messages, anthropicOutputText(response),
-        response.usage?.input_tokens || 0,
-        response.usage?.output_tokens || 0,
+        anthropicUsage(response.usage),
         metadata, 'anthropic'
       )
     );
@@ -820,18 +847,15 @@ export class SignalVaultClient {
     const response = await this.anthropic.messages.create(params);
 
     if (params.stream) {
-      return this.wrapAnthropicStream(response, (output, inputTokens, outputTokens) =>
-        this.sendResponseEvent(
-          requestId, params.model, output, inputTokens, outputTokens, metadata, 'anthropic', fallback
-        )
+      return this.wrapAnthropicStream(response, (output, usage) =>
+        this.sendResponseEvent(requestId, params.model, output, usage, metadata, 'anthropic', fallback)
       );
     }
 
     this.track(
       this.sendResponseEvent(
         requestId, params.model, anthropicOutputText(response),
-        response.usage?.input_tokens || 0,
-        response.usage?.output_tokens || 0,
+        anthropicUsage(response.usage),
         metadata, 'anthropic', fallback
       )
     );
@@ -877,27 +901,27 @@ export class SignalVaultClient {
 
   private async *wrapAnthropicStream(
     stream: AsyncIterable<any>,
-    onComplete: (output: string, inputTokens: number, outputTokens: number) => Promise<void>
+    onComplete: (output: string, usage: Record<string, number>) => Promise<void>
   ) {
     const chunks: string[] = [];
-    let inputTokens = 0;
-    let outputTokens = 0;
+    let usage = anthropicUsage();
 
     try {
       for await (const event of stream) {
         if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
           chunks.push(event.delta.text || '');
         }
+        // message_delta may repeat the input and cache counts; its values win.
         if (event.type === 'message_start' && event.message?.usage) {
-          inputTokens = event.message.usage.input_tokens || 0;
+          usage = anthropicUsage(usage, event.message.usage);
         }
         if (event.type === 'message_delta' && event.usage) {
-          outputTokens = event.usage.output_tokens || 0;
+          usage = anthropicUsage(usage, event.usage);
         }
         yield event;
       }
     } finally {
-      this.track(onComplete(chunks.join(''), inputTokens, outputTokens));
+      this.track(onComplete(chunks.join(''), usage));
     }
   }
 
@@ -1155,8 +1179,7 @@ export class SignalVaultClient {
     requestId: string,
     model: string,
     output: string,
-    promptTokens: number,
-    completionTokens: number,
+    usage: Record<string, number>,
     metadata: Record<string, unknown>,
     provider: string,
     fallbackRequest?: Record<string, unknown> | null
@@ -1176,7 +1199,7 @@ export class SignalVaultClient {
       metadata,
       payload: {
         output,
-        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens },
+        usage,
       },
     });
   }
@@ -1191,8 +1214,7 @@ export class SignalVaultClient {
     model: string,
     messages: unknown[],
     output: string,
-    promptTokens: number,
-    completionTokens: number,
+    usage: Record<string, number>,
     metadata: Record<string, unknown>,
     provider: string
   ): Promise<void> {
@@ -1214,7 +1236,7 @@ export class SignalVaultClient {
       type: 'ai.response',
       payload: {
         output,
-        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens },
+        usage,
         monitor_mode: true,
       },
     });

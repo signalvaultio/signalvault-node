@@ -313,6 +313,110 @@ describe('Anthropic system prompt', () => {
   });
 });
 
+// The server reads Anthropic usage under Anthropic's names and adds the cache
+// counts to the input. Under OpenAI's `prompt_tokens` it would take the count
+// as already including them, so the SDK must not rename.
+describe('Anthropic usage', () => {
+  function usageClient(reply: { usage?: unknown; events?: unknown[] }, mirrorMode = false) {
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake', mirrorMode });
+    (client as any).anthropic = {
+      messages: {
+        create: async (p: any) =>
+          p.stream
+            ? (async function* () {
+                for (const e of reply.events ?? []) yield e;
+              })()
+            : { content: [{ type: 'text', text: 'ok' }], usage: reply.usage },
+      },
+    };
+    return client;
+  }
+
+  async function recordedUsage(
+    client: SignalVaultClient,
+    f: ReturnType<typeof stubFetch>,
+    opts: { stream?: boolean; breakAfter?: number } = {}
+  ) {
+    const result: any = await client.messages.create({
+      model: 'claude', max_tokens: 5, messages, stream: opts.stream,
+    });
+    if (opts.stream) {
+      let seen = 0;
+      for await (const _ of result) {
+        if (++seen === opts.breakAfter) break;
+      }
+    }
+    await client.flush();
+    return f.calls.find((c) => c.body.type === 'ai.response')?.body.payload.usage;
+  }
+
+  const cached = {
+    input_tokens: 12,
+    cache_creation_input_tokens: 2_000,
+    cache_read_input_tokens: 90_000,
+    output_tokens: 300,
+  };
+  const text = { type: 'content_block_delta', delta: { type: 'text_delta', text: 'ok' } };
+
+  it.each([false, true])('is sent under Anthropic names, with the cache counts (mirrorMode: %s)', async (mirrorMode) => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    expect(await recordedUsage(usageClient({ usage: cached }, mirrorMode), f)).toEqual(cached);
+  });
+
+  it('leaves out cache counts that are null or missing, and defaults input and output to 0', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({ usage: { cache_creation_input_tokens: null, cache_read_input_tokens: 7 } });
+    expect(await recordedUsage(client, f)).toEqual({
+      input_tokens: 0, cache_read_input_tokens: 7, output_tokens: 0,
+    });
+  });
+
+  it('is sent with zero counts when the response has no usage', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    expect(await recordedUsage(usageClient({}), f)).toEqual({ input_tokens: 0, output_tokens: 0 });
+  });
+
+  it('streaming: keeps the counts from message_start and takes output from message_delta', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      events: [
+        { type: 'message_start', message: { usage: { ...cached, output_tokens: 1 } } },
+        text,
+        { type: 'message_delta', usage: { output_tokens: 300 } },
+        { type: 'message_stop' },
+      ],
+    });
+    expect(await recordedUsage(client, f, { stream: true })).toEqual(cached);
+  });
+
+  it('streaming: input and cache counts in message_delta override message_start', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      events: [
+        { type: 'message_start', message: { usage: { input_tokens: 1, cache_read_input_tokens: 1, output_tokens: 1 } } },
+        text,
+        { type: 'message_delta', usage: cached },
+        { type: 'message_stop' },
+      ],
+    }, true);
+    expect(await recordedUsage(client, f, { stream: true })).toEqual(cached);
+  });
+
+  it('streaming: records the message_start counts when the consumer breaks out early', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      events: [
+        { type: 'message_start', message: { usage: { ...cached, output_tokens: 1 } } },
+        text,
+        { type: 'message_delta', usage: { output_tokens: 300 } },
+      ],
+    });
+    expect(await recordedUsage(client, f, { stream: true, breakAfter: 2 })).toEqual({
+      ...cached, output_tokens: 1,
+    });
+  });
+});
+
 describe('mirror mode', () => {
   it('sends ai.request before ai.response, never concurrently', async () => {
     const order: string[] = [];
