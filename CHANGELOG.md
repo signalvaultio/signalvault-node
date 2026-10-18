@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 — 2026-10-18
+
+Token counts for Anthropic prompt caching.
 
 ### Fixes
 
