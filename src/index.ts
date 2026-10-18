@@ -295,20 +295,34 @@ const ANTHROPIC_USAGE_KEYS = [
   'output_tokens',
 ] as const;
 
+/** `usage.cache_creation`: the cache writes by cache lifetime, priced differently. */
+const CACHE_CREATION_KEYS = ['ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'] as const;
+
+type UsageCounts = Record<string, number>;
+type Usage = Record<string, number | UsageCounts>;
+
+function copyCounts(target: UsageCounts, source: any, keys: readonly string[]): UsageCounts {
+  for (const key of keys) {
+    const n = source?.[key];
+    if (typeof n === 'number' && Number.isFinite(n) && n >= 0) target[key] = n;
+  }
+  return target;
+}
+
 /**
  * Anthropic usage under Anthropic's own names, as the proxy records it. The
  * server adds the cache counts to `input_tokens`; renamed to `prompt_tokens`,
  * which for OpenAI already includes cached tokens, they would be lost. Later
  * sources override earlier ones, but only with a count.
  */
-function anthropicUsage(...sources: any[]): Record<string, number> {
-  const usage: Record<string, number> = { input_tokens: 0, output_tokens: 0 };
+function anthropicUsage(...sources: any[]): Usage {
+  const usage: Usage = { input_tokens: 0, output_tokens: 0 };
+  let cacheCreation: UsageCounts = {};
   for (const source of sources) {
-    for (const key of ANTHROPIC_USAGE_KEYS) {
-      const n = source?.[key];
-      if (typeof n === 'number' && Number.isFinite(n) && n >= 0) usage[key] = n;
-    }
+    copyCounts(usage as UsageCounts, source, ANTHROPIC_USAGE_KEYS);
+    cacheCreation = copyCounts(cacheCreation, source?.cache_creation, CACHE_CREATION_KEYS);
   }
+  if (Object.keys(cacheCreation).length) usage.cache_creation = cacheCreation;
   return usage;
 }
 
@@ -901,7 +915,7 @@ export class SignalVaultClient {
 
   private async *wrapAnthropicStream(
     stream: AsyncIterable<any>,
-    onComplete: (output: string, usage: Record<string, number>) => Promise<void>
+    onComplete: (output: string, usage: Usage) => Promise<void>
   ) {
     const chunks: string[] = [];
     let usage = anthropicUsage();
@@ -1179,7 +1193,7 @@ export class SignalVaultClient {
     requestId: string,
     model: string,
     output: string,
-    usage: Record<string, number>,
+    usage: Usage,
     metadata: Record<string, unknown>,
     provider: string,
     fallbackRequest?: Record<string, unknown> | null
@@ -1214,7 +1228,7 @@ export class SignalVaultClient {
     model: string,
     messages: unknown[],
     output: string,
-    usage: Record<string, number>,
+    usage: Usage,
     metadata: Record<string, unknown>,
     provider: string
   ): Promise<void> {

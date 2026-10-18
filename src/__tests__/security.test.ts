@@ -371,6 +371,30 @@ describe('Anthropic usage', () => {
     });
   });
 
+  // The server prices 1-hour cache writes from this breakdown.
+  it('includes the cache_creation breakdown, without anything else in it', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      usage: {
+        ...cached,
+        cache_creation: { ephemeral_5m_input_tokens: 500, ephemeral_1h_input_tokens: 1_500, other: 1 },
+        service_tier: 'standard',
+      },
+    });
+    expect(await recordedUsage(client, f)).toEqual({
+      ...cached,
+      cache_creation: { ephemeral_5m_input_tokens: 500, ephemeral_1h_input_tokens: 1_500 },
+    });
+  });
+
+  it('leaves out a cache_creation breakdown with no counts', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      usage: { ...cached, cache_creation: { ephemeral_5m_input_tokens: null } },
+    });
+    expect(await recordedUsage(client, f)).toEqual(cached);
+  });
+
   it('is sent with zero counts when the response has no usage', async () => {
     const f = stubFetch({ 'ai.request': [allow] });
     expect(await recordedUsage(usageClient({}), f)).toEqual({ input_tokens: 0, output_tokens: 0 });
@@ -400,6 +424,30 @@ describe('Anthropic usage', () => {
       ],
     }, true);
     expect(await recordedUsage(client, f, { stream: true })).toEqual(cached);
+  });
+
+  it('streaming: a cache_creation breakdown in message_delta overrides message_start count by count', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = usageClient({
+      events: [
+        {
+          type: 'message_start',
+          message: {
+            usage: {
+              ...cached,
+              cache_creation: { ephemeral_5m_input_tokens: 2_000, ephemeral_1h_input_tokens: 0 },
+            },
+          },
+        },
+        text,
+        { type: 'message_delta', usage: { output_tokens: 300, cache_creation: { ephemeral_1h_input_tokens: 5 } } },
+        { type: 'message_stop' },
+      ],
+    });
+    expect(await recordedUsage(client, f, { stream: true })).toEqual({
+      ...cached,
+      cache_creation: { ephemeral_5m_input_tokens: 2_000, ephemeral_1h_input_tokens: 5 },
+    });
   });
 
   it('streaming: records the message_start counts when the consumer breaks out early', async () => {

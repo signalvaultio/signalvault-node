@@ -102,12 +102,12 @@ const server = createServer((req, res) => {
         return json(200, {
           ...message, stop_reason: 'end_turn',
           content: [{ type: 'text', text: 'Hi there' }],
-          usage: { input_tokens: 4, cache_creation_input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 1 },
+          usage: { input_tokens: 4, cache_creation_input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 1, cache_creation: { ephemeral_5m_input_tokens: 15, ephemeral_1h_input_tokens: 5 } },
         });
       }
       const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
       return sse(res, [
-        ev('message_start', { message: { ...message, content: [], stop_reason: null, usage: { input_tokens: 4, cache_creation_input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 0 } } }),
+        ev('message_start', { message: { ...message, content: [], stop_reason: null, usage: { input_tokens: 4, cache_creation_input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 0, cache_creation: { ephemeral_5m_input_tokens: 15, ephemeral_1h_input_tokens: 5 } } } }),
         ev('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
         ev('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'Hi' } }),
         ev('content_block_stop', { index: 0 }),
@@ -182,9 +182,13 @@ async function anthropicScenario(Client, tag) {
   const req = recorded.find((e) => e.type === 'ai.request');
   check(tag + ' anthropic system prompt scanned', req?.payload.messages[0]?.role === 'system', req?.payload);
   const responses = recorded.filter((e) => e.type === 'ai.response');
-  const anthropicUsage = JSON.stringify({ input_tokens: 4, output_tokens: 1, cache_creation_input_tokens: 20, cache_read_input_tokens: 100 });
+  const usageKey = (u) => JSON.stringify(u, Object.keys({ ...u, ...u.cache_creation }).sort());
+  const anthropicUsage = usageKey({
+    input_tokens: 4, output_tokens: 1, cache_creation_input_tokens: 20, cache_read_input_tokens: 100,
+    cache_creation: { ephemeral_5m_input_tokens: 15, ephemeral_1h_input_tokens: 5 },
+  });
   check(tag + ' anthropic usage sent under Anthropic names, with cache counts',
-    responses.length === 2 && responses.every((r) => JSON.stringify(r.payload.usage) === anthropicUsage),
+    responses.length === 2 && responses.every((r) => usageKey(r.payload.usage) === anthropicUsage),
     responses.map((r) => r.payload.usage));
   const outputs = responses.map((r) => r.payload.output).sort();
   check(tag + ' anthropic output recorded (non-streaming, streaming)',
