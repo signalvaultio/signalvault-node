@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-10-22
+
+Audit events are queued and retried, and requests over the rule-check rate limit stay in the audit log.
 
 ### Added
 
