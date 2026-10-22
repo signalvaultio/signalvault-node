@@ -285,7 +285,7 @@ describe('fail_mode on the pre-flight', () => {
     const fallback = stubFetch({ 'ai.request': [{ status: 503 }] });
     await makeClient().client.chat.completions.create({ model: 'm', messages });
     await new Promise((resolve) => setImmediate(resolve));
-    expect(fallback.calls[1].body.payload).toEqual({ messages, preflight_unavailable: true });
+    expect(fallback.calls[1].body.payload).toEqual({ messages, preflight_unavailable: true, fail_mode: 'open' });
   });
 });
 
@@ -686,7 +686,7 @@ describe('audit when the pre-flight got no decision', () => {
     const fallback = f.calls[1].body;
     expect(fallback.request_id).toBe(f.calls[0].body.request_id);
     expect(fallback.event_id).toBeUndefined();
-    expect(fallback.payload).toEqual({ messages, preflight_unavailable: true });
+    expect(fallback.payload).toEqual({ messages, preflight_unavailable: true, fail_mode: 'open' });
   });
 
   it('sends no audit events after the server refused the pre-flight (401)', async () => {

@@ -1045,7 +1045,9 @@ export class SignalVaultClient {
     if (failed === 'skip') return null;
     return {
       ...this.requestBody(requestId, model, messages, metadata, provider),
-      payload: { messages, preflight_unavailable: true },
+      // A fallback is only sent once the call has gone to the provider, so a
+      // request recorded unchecked from it was forwarded.
+      payload: { messages, preflight_unavailable: true, fail_mode: 'open' },
     };
   }
 
