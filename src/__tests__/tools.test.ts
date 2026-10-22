@@ -15,7 +15,9 @@ describe('Agent tool-use capture', () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Stops any retry before fetch is restored.
+    await client.close(0);
     fetchMock.mockRestore();
   });
 
@@ -271,6 +273,8 @@ describe('Agent tool-use capture', () => {
 
       expect(warnSpy).not.toHaveBeenCalled();
       expect(errorSpy).not.toHaveBeenCalled();
+      // The event is still queued for a retry; drop it while console is mocked.
+      await client.close(0);
     });
   });
 

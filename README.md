@@ -195,7 +195,12 @@ The pre-flight guardrail check is in your request's critical path. If it cannot 
 
 `failMode` applies to the pre-flight check, so it has no effect in mirror mode.
 
-**Rate limit.** The ingest API allows 120 events per minute per app, and each call sends two (request and response), plus one per tool call. Above roughly 60 LLM calls a minute, pre-flight checks are rate limited: with `failMode: 'open'` those requests go through unchecked. If you run at that volume and need enforcement, use `failMode: 'closed'`.
+**Rate limits.** Rule checks — the pre-flight `ai.request` — are limited to 120 requests per minute per app. Over that limit, SignalVault still records the request in your audit log, marked as unchecked, but runs no rules on it, so there is no decision and `failMode` applies:
+
+- `'open'`: the request goes to the provider, the SDK warns that guardrails were not applied, and the response is recorded as usual, linked to the request. Tool calls are recorded as usual too.
+- `'closed'`: the SDK throws `SignalVaultUnavailableError` with `status` 429, and the provider is never called.
+
+The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Audit events — responses, tool calls, mirror-mode events — have a separate limit of 3,000 events per minute per app, and are retried when they reach it (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
 
 ```typescript
 const client = new SignalVaultClient({
@@ -203,19 +208,57 @@ const client = new SignalVaultClient({
   openaiApiKey: process.env.OPENAI_API_KEY!,
   failMode: 'closed',      // 'open' | 'closed'. Default: 'open'
   preflightTimeout: 2000,  // ms — pre-flight check timeout. Default: 2000
-  timeout: 10000,          // ms — background/post-flight calls. Default: 10000
+  timeout: 10000,          // ms — each attempt to send an audit event. Default: 10000
 });
 ```
 
-Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted. The SDK retries once on connection errors and 5xx (not on timeouts). A rate-limited (429) event is retried only if `Retry-After` is 5 seconds or less; the SignalVault API currently asks for 60, so in practice those events are dropped, with a warning. `tools.record()` does not retry.
+## Delivery of Audit Events
+
+Audit events (responses, tool calls, mirror-mode events, and the background record of a request whose check failed, described above) are sent in the background through an in-memory queue, so they never delay your call.
+
+- **Retries.** A send that fails with a connection error, a timeout, a 5xx or a 429 is retried, up to 6 attempts over about two minutes. The wait doubles each time: 4, 8, 16, 32 and 60 seconds, each shortened by up to a quarter at random so that clients do not retry in step. When SignalVault sends `Retry-After`, the SDK waits that long instead, up to 60 seconds. Other 4xx responses are not retried.
+- **No double counting.** Each event carries an `event_id` that stays the same across retries, so SignalVault stores it once. The fallback request is de-duplicated by its `request_id`.
+- **Order.** A response is sent after its request has been stored. If the request is dropped, its response is not sent.
+- **Dropping is the last resort.** Up to 1,000 events can wait to be sent. Beyond that the oldest waiting event is dropped, and an event is also dropped after its last attempt. Either way the SDK prints a warning with the number of events lost (at most once a minute per cause, whether or not `debug` is on). A dropped event is not in your audit log.
+- **`tools.record()`** resolves after the first attempt. If that attempt failed and can be retried, the event stays in the queue and is retried like the others.
+
+The queue never keeps your process alive: a pending retry does not stop Node from exiting. Use `flush()` to wait for it.
 
 ## Shutting Down
 
-Background events are queued in memory. Before a short-lived process exits (a script, a serverless handler), wait for them:
+Before a short-lived process exits, wait for the queue:
 
 ```typescript
-await client.flush();   // or client.close(); both wait up to 5s by default
+await client.flush();       // waits up to 5 seconds
+await client.flush(10_000); // or up to 10
 ```
+
+`flush()` sends every queued event at once, including those waiting out a retry, and resolves when all of them are delivered or the deadline passes. At the deadline it prints a warning; the events still queued stay in the queue and keep being retried while the process runs.
+
+**Serverless functions** (AWS Lambda, Vercel, Google Cloud Functions and similar) are frozen or stopped as soon as the handler returns, so call `flush()` at the end of every invocation, not only at shutdown. Create the client outside the handler, so a warm instance reuses it:
+
+```typescript
+const client = new SignalVaultClient({
+  apiKey: process.env.SIGNALVAULT_API_KEY!,
+  openaiApiKey: process.env.OPENAI_API_KEY!,
+});
+
+export async function handler(event: { prompt: string }) {
+  try {
+    const response = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: event.prompt }],
+    });
+    return { statusCode: 200, body: response.choices[0].message.content };
+  } finally {
+    await client.flush();
+  }
+}
+```
+
+The time `flush()` takes counts towards your function's duration: when SignalVault is reachable, it is the time to send the events still in flight. Pass a shorter deadline to bound it.
+
+`close()` flushes the same way, then drops whatever is still undelivered, with a warning, and stops retrying it. Use it when a long-running process shuts down. The client can still be used afterwards.
 
 ## Mirror Mode
 
@@ -256,7 +299,7 @@ const client = new SignalVaultClient({
   mirrorMode: false,
   failMode: 'open',                 // 'open' | 'closed' — see "When SignalVault Is Unavailable"
   preflightTimeout: 2000,           // ms
-  timeout: 10000,                   // ms
+  timeout: 10000,                   // ms, per attempt to send an audit event
   metadata: {},                     // Default metadata for all events
 });
 ```

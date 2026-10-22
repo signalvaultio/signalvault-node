@@ -52,22 +52,39 @@ function openaiStub(chunks?: unknown[]) {
   };
 }
 
+/** Clients from makeClient(), closed after each test so no retry outlives it. */
+const clients: SignalVaultClient[] = [];
+
 function makeClient(config: Partial<SignalVaultConfig> = {}) {
   const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake', ...config });
   const openai = openaiStub();
   (client as any).openai = openai.client;
+  clients.push(client);
   return { client, openai };
+}
+
+/**
+ * Fake timers for the retry backoff. Microtasks and setImmediate stay real:
+ * Response bodies need them. Math.random is pinned so the jitter takes
+ * nothing off and each backoff is exact: 4s, 8s, 16s, 32s, 60s.
+ */
+function fakeTimers() {
+  jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask', 'setImmediate'] });
+  jest.spyOn(Math, 'random').mockReturnValue(1);
 }
 
 const allow = { status: 200, body: { decision: 'allow', violations: [], redactions: [] } };
 const messages = [{ role: 'user' as const, content: 'hi' }];
+const dropWarnings = () => warnSpy.mock.calls.map((c) => c[0]).filter((m) => /[Dd]ropped/.test(m));
 
 let warnSpy: jest.SpyInstance;
 beforeEach(() => {
   warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
-afterEach(() => {
+afterEach(async () => {
+  for (const client of clients.splice(0)) await client.close(0);
   jest.restoreAllMocks();
+  jest.useRealTimers();
 });
 
 describe('baseUrl', () => {
@@ -162,10 +179,12 @@ describe('apiKey', () => {
     jest.spyOn(global, 'fetch').mockRejectedValue(failure);
     const { client } = makeClient({ debug: true });
     await client.chat.completions.create({ model: 'm', messages });
-    await client.flush();
+    // The fallback ai.request's first attempt fails the same way.
+    await new Promise((resolve) => setImmediate(resolve));
 
     const logged = errorSpy.mock.calls.map((args) => args.join(' ')).join('\n');
     expect(logged).toContain('Pre-flight failed: TypeError: fetch failed <- Error: bad header "Bearer [redacted]"');
+    expect(logged).toContain('Event send failed: TypeError: fetch failed <- Error: bad header "Bearer [redacted]"');
     expect(logged).not.toContain('sk_test_abc');
   });
 });
@@ -238,6 +257,115 @@ describe('pre-flight failures', () => {
 
   it('rejects an unknown failMode', () => {
     expect(() => makeClient({ failMode: 'maybe' as any })).toThrow(/failMode/);
+  });
+});
+
+describe('fail_mode on the pre-flight', () => {
+  it.each([
+    [undefined, 'open'],
+    ['open', 'open'],
+    ['closed', 'closed'],
+  ] as const)('is sent in the payload (failMode: %s)', async (failMode, expected) => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const { client } = makeClient({ failMode });
+    await client.chat.completions.create({ model: 'm', messages });
+    expect(f.calls[0].body.payload).toEqual({ messages, fail_mode: expected });
+  });
+
+  // Mirror mode never forwards on a decision, and the fallback ai.request is
+  // a record of a call already made.
+  it('is not sent on mirror-mode or fallback requests', async () => {
+    const mirror = stubFetch();
+    const { client } = makeClient({ mirrorMode: true });
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(mirror.calls[0].body.payload).toEqual({ messages, monitor_mode: true });
+    mirror.spy.mockRestore();
+
+    const fallback = stubFetch({ 'ai.request': [{ status: 503 }] });
+    await makeClient().client.chat.completions.create({ model: 'm', messages });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fallback.calls[1].body.payload).toEqual({ messages, preflight_unavailable: true });
+  });
+});
+
+// Over the app's rule-check rate limit the server stores the ai.request
+// unchecked and answers 429 with `recorded: true`.
+describe('pre-flight over the rule-check rate limit (429, recorded)', () => {
+  const recorded = {
+    status: 429,
+    headers: { 'retry-after': '60' },
+    body: {
+      error: 'rate_limited', recorded: true, event_id: 'evt_1', decision: 'unchecked', reason: 'pre_flight_rate_limited',
+    },
+  };
+
+  it('fail-open warns, forwards, and sends the response without a fallback ai.request', async () => {
+    const f = stubFetch({ 'ai.request': [recorded] });
+    const { client, openai } = makeClient();
+    const completion = await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    expect(completion.choices[0].message.content).toBe('hello');
+    expect(openai.sent).toHaveLength(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(
+      /rule-check rate limit reached \(429\)\. Guardrails were NOT applied.*still recorded in the audit log/
+    );
+    expect(f.types()).toEqual(['ai.request', 'ai.response']);
+    expect(f.calls[1].body.request_id).toBe(f.calls[0].body.request_id);
+    expect(f.calls[1].body.payload.output).toBe('hello');
+  });
+
+  it('fail-open, streaming: the response is sent when the stream ends', async () => {
+    const f = stubFetch({ 'ai.request': [recorded] });
+    const client = new SignalVaultClient({ apiKey: 'sk_test_abc', openaiApiKey: 'sk-fake' });
+    (client as any).openai = openaiStub([{ choices: [{ delta: { content: 'hi' } }] }]).client;
+    const stream = await client.chat.completions.create({ model: 'm', messages, stream: true });
+    for await (const _ of stream) void _;
+    await client.flush();
+    expect(f.types()).toEqual(['ai.request', 'ai.response']);
+    expect(f.calls[1].body.payload.output).toBe('hi');
+  });
+
+  it('fail-closed throws SignalVaultUnavailableError and sends nothing else', async () => {
+    const f = stubFetch({ 'ai.request': [recorded] });
+    const { client, openai } = makeClient({ failMode: 'closed' });
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    await client.flush();
+
+    expect(err).toBeInstanceOf(SignalVaultUnavailableError);
+    expect(err.status).toBe(429);
+    expect(err.requestId).toBe(f.calls[0].body.request_id);
+    expect(err.message).toMatch(/rate limit.*Request not sent \(failMode: 'closed'\)/);
+    expect(openai.sent).toHaveLength(0);
+    expect(f.types()).toEqual(['ai.request']);
+  });
+
+  it.each([
+    ['no recorded field', { error: 'rate_limited' }, /rate limit reached/],
+    ['recorded: false', { error: 'rate_limited', recorded: false }, /rate limit reached/],
+    ['recorded as a string', { error: 'rate_limited', recorded: 'true' }, /rate limit reached/],
+    ['trial limit', { error: { type: 'trial_limit_exceeded' } }, /trial limit/],
+  ])('a 429 with %s is handled as before: forwarded, no audit events', async (_label, body, pattern) => {
+    const f = stubFetch({ 'ai.request': [{ status: 429, headers: { 'retry-after': '60' }, body }] });
+    const { client, openai } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    expect(openai.sent).toHaveLength(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(pattern);
+    expect(warnSpy.mock.calls[0][0]).not.toMatch(/still recorded/);
+    expect(f.types()).toEqual(['ai.request']);
+  });
+
+  it('a plain 429 still throws in fail-closed', async () => {
+    stubFetch({ 'ai.request': [{ status: 429, body: { error: 'rate_limited' } }] });
+    const { client, openai } = makeClient({ failMode: 'closed' });
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultUnavailableError);
+    expect(err.status).toBe(429);
+    expect(openai.sent).toHaveLength(0);
   });
 });
 
@@ -521,7 +649,7 @@ describe('background delivery', () => {
     await client.flush();
   });
 
-  it('retries once on 503 with the same event_id', async () => {
+  it('flush() retries a 503 at once, with the same event_id', async () => {
     const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }, { status: 200 }] });
     const { client } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
@@ -530,27 +658,6 @@ describe('background delivery', () => {
     const responses = f.calls.filter((c) => c.body.type === 'ai.response');
     expect(responses).toHaveLength(2);
     expect(responses[0].body.event_id).toBe(responses[1].body.event_id);
-  });
-
-  it('honours a short Retry-After on 429 and drops with a warning on a long one', async () => {
-    const f = stubFetch({
-      'ai.request': [allow, allow],
-      'ai.response': [
-        { status: 429, headers: { 'retry-after': '0' } },
-        { status: 200 },
-        { status: 429, headers: { 'retry-after': '60' } },
-      ],
-    });
-    const { client } = makeClient();
-
-    await client.chat.completions.create({ model: 'm', messages });
-    await client.flush();
-    expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(2);
-
-    await client.chat.completions.create({ model: 'm', messages });
-    await client.flush();
-    expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(3);
-    expect(warnSpy.mock.calls.some((c) => /events are being dropped/.test(c[0]))).toBe(true);
   });
 
   it('flush() waits for pending tool events', async () => {
@@ -633,41 +740,239 @@ describe('failure classification', () => {
 });
 
 describe('background retry policy', () => {
-  it('does not retry a timed-out event', async () => {
-    let responses = 0;
+  beforeEach(fakeTimers);
+
+  const responsesOf = (f: ReturnType<typeof stubFetch>) => f.calls.filter((c) => c.body.type === 'ai.response');
+
+  it('retries 5xx with exponential backoff, keeping the event_id', async () => {
+    const f = stubFetch({
+      'ai.request': [allow],
+      'ai.response': [{ status: 503 }, { status: 502 }, { status: 500 }, { status: 200 }],
+    });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(responsesOf(f)).toHaveLength(1);
+
+    await jest.advanceTimersByTimeAsync(3_999);
+    expect(responsesOf(f)).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(responsesOf(f)).toHaveLength(2);
+    await jest.advanceTimersByTimeAsync(8_000);
+    expect(responsesOf(f)).toHaveLength(3);
+    await jest.advanceTimersByTimeAsync(16_000);
+    expect(responsesOf(f)).toHaveLength(4);
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(responsesOf(f)).toHaveLength(4);
+
+    expect(new Set(responsesOf(f).map((c) => c.body.event_id)).size).toBe(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('honours Retry-After on 429, capped at 60 seconds, without warning', async () => {
+    const f = stubFetch({
+      'ai.request': [allow],
+      'ai.response': [
+        { status: 429, headers: { 'retry-after': '30' } },
+        { status: 429, headers: { 'retry-after': '3600' } },
+        { status: 200 },
+      ],
+    });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(29_999);
+    expect(responsesOf(f)).toHaveLength(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(responsesOf(f)).toHaveLength(2);
+    await jest.advanceTimersByTimeAsync(59_999);
+    expect(responsesOf(f)).toHaveLength(2);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(responsesOf(f)).toHaveLength(3);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('retries network errors and timeouts with the same event_id', async () => {
+    const failures = [new TypeError('fetch failed'), new DOMException('timed out', 'TimeoutError')];
+    const ids: string[] = [];
     jest.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
-      const type = JSON.parse((init as RequestInit).body as string).type;
-      if (type === 'ai.response') {
-        responses++;
-        throw new DOMException('timed out', 'TimeoutError');
+      const body = JSON.parse((init as RequestInit).body as string);
+      if (body.type === 'ai.response') {
+        ids.push(body.event_id);
+        const failure = failures.shift();
+        if (failure) throw failure;
       }
       return new Response(JSON.stringify(allow.body), { status: 200 });
     });
     const { client } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
-    await client.flush();
-    expect(responses).toBe(1);
+    await jest.advanceTimersByTimeAsync(4_000 + 8_000);
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(1);
   });
 
-  it('warns when the retry is rate limited too', async () => {
-    stubFetch({
-      'ai.request': [allow],
-      'ai.response': [
-        { status: 429, headers: { 'retry-after': '0' } },
-        { status: 429, headers: { 'retry-after': '60' } },
-      ],
-    });
+  it('drops an event after 6 attempts, and only then warns', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
     const { client } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
-    await client.flush();
-    expect(warnSpy.mock.calls.some((c) => /events are being dropped/.test(c[0]))).toBe(true);
+    await jest.advanceTimersByTimeAsync(4_000 + 8_000 + 16_000 + 32_000);
+    expect(responsesOf(f)).toHaveLength(5);
+    expect(dropWarnings()).toEqual([]);
+
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(responsesOf(f)).toHaveLength(6);
+    expect(dropWarnings()).toHaveLength(1);
+    expect(dropWarnings()[0]).toMatch(/Dropped 1 audit event\(s\).*not appear in your audit log.*6 delivery attempts \(last: 503\)/);
+
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(responsesOf(f)).toHaveLength(6);
   });
 
-  it('tools.record() does not retry', async () => {
+  it.each([400, 401, 404, 422])('does not retry a %i', async (status) => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(responsesOf(f)).toHaveLength(1);
+    expect(dropWarnings()).toEqual([]);
+  });
+
+  it('retries the fallback ai.request without an event_id; the response follows once it lands', async () => {
+    const f = stubFetch({ 'ai.request': [{ status: 503 }, { status: 503 }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(f.types()).toEqual(['ai.request', 'ai.request']);
+
+    await jest.advanceTimersByTimeAsync(4_000);
+    expect(f.types()).toEqual(['ai.request', 'ai.request', 'ai.request', 'ai.response']);
+    const [preflight, ...fallbacks] = f.calls.slice(0, 3).map((c) => c.body);
+    for (const fallback of fallbacks) {
+      expect(fallback.request_id).toBe(preflight.request_id);
+      expect(fallback.event_id).toBeUndefined();
+      expect(fallback.payload.preflight_unavailable).toBe(true);
+    }
+  });
+
+  it('mirror mode: does not send the response when its request is dropped, and counts both', async () => {
+    const f = stubFetch({ 'ai.request': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient({ mirrorMode: true });
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(f.types()).toEqual(Array(6).fill('ai.request'));
+    expect(dropWarnings()).toHaveLength(1);
+    expect(dropWarnings()[0]).toMatch(/Dropped 2 audit event\(s\)/);
+  });
+
+  it('tools.record() resolves after the first attempt; the event is retried in the background', async () => {
     const f = stubFetch({ 'agent.tool_call': [{ status: 503 }, { status: 200 }] });
     const { client } = makeClient();
     await client.tools.record({ toolName: 't', durationMs: 1 });
     expect(f.types()).toEqual(['agent.tool_call']);
+
+    await jest.advanceTimersByTimeAsync(4_000);
+    expect(f.types()).toEqual(['agent.tool_call', 'agent.tool_call']);
+    expect(f.calls[0].body.event_id).toBe(f.calls[1].body.event_id);
+  });
+});
+
+describe('retry timer', () => {
+  it('is unref\'d, so a waiting retry never keeps the process alive', async () => {
+    stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await new Promise((resolve) => setImmediate(resolve));
+    const timer = (client as any).queue.timer as NodeJS.Timeout;
+    expect(timer).not.toBeNull();
+    expect(timer.hasRef()).toBe(false);
+  });
+});
+
+describe('queue overflow', () => {
+  it('drops the oldest waiting event beyond 1,000, with a rate-limited warning that counts them', async () => {
+    fakeTimers();
+    let hold = true;
+    const held: Array<() => void> = [];
+    const sent: number[] = [];
+    jest.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      sent.push(JSON.parse((init as RequestInit).body as string).payload.duration_ms);
+      if (hold) await new Promise<void>((resolve) => held.push(resolve));
+      return new Response('{}', { status: 200 });
+    });
+    const { client } = makeClient();
+    const record = (n: number) => void client.tools.record({ toolName: 't', durationMs: n });
+
+    // 16 in flight (held), then 1,000 waiting: full, nothing dropped yet.
+    for (let n = 0; n < 1016; n++) record(n);
+    expect(sent).toHaveLength(16);
+    expect(dropWarnings()).toEqual([]);
+
+    record(1016); // drops 16, the oldest waiting
+    expect(dropWarnings()).toHaveLength(1);
+    expect(dropWarnings()[0]).toMatch(
+      /queue full \(1000 events waiting to be sent\): dropped the oldest 1 audit event\(s\), which will not appear/
+    );
+    record(1017); // drops 17; the warning is rate limited
+    expect(dropWarnings()).toHaveLength(1);
+    jest.setSystemTime(Date.now() + 60_000);
+    record(1018); // drops 18
+    expect(dropWarnings()).toHaveLength(2);
+    expect(dropWarnings()[1]).toMatch(/dropped the oldest 2 audit event\(s\)/);
+
+    hold = false;
+    held.splice(0).forEach((release) => release());
+    await client.flush();
+    const expected = [...Array(1019).keys()].filter((n) => n < 16 || n > 18);
+    expect(sent).toEqual(expected);
+  });
+});
+
+describe('flush() and close()', () => {
+  beforeEach(fakeTimers);
+
+  it('flush() sends a waiting retry at once instead of waiting out the backoff', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    await client.flush();
+    expect(f.types()).toEqual(['ai.request', 'ai.response', 'ai.response']);
+    expect((client as any).queue.size).toBe(0);
+  });
+
+  it('flush() returns at the deadline with a warning; the event stays queued and is retried', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+
+    const flushed = client.flush(1_000);
+    await jest.advanceTimersByTimeAsync(1_000);
+    await flushed;
+    expect(warnSpy.mock.calls.some((c) => /flush\(\) timed out with 1 audit event\(s\) still queued/.test(c[0]))).toBe(true);
+    expect(dropWarnings()).toEqual([]);
+    const attempts = f.types().filter((t) => t === 'ai.response').length;
+    expect(attempts).toBe(2); // the first, and the one flush() started at once
+
+    await jest.advanceTimersByTimeAsync(8_000);
+    expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(attempts + 1);
+  });
+
+  it('close() drops what is still undelivered at the deadline, says so, and stops retrying', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+
+    const closed = client.close(1_000);
+    await jest.advanceTimersByTimeAsync(1_000);
+    await closed;
+    expect(dropWarnings()).toEqual([
+      expect.stringMatching(/close\(\) dropped 1 audit event\(s\), which will not appear.*before the deadline/),
+    ]);
+    const attempts = f.types().length;
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(f.types()).toHaveLength(attempts);
+    expect((client as any).queue.size).toBe(0);
   });
 });
 

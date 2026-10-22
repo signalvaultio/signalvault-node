@@ -9,6 +9,7 @@ import {
   validateToolName,
   wrapTool,
 } from './tools';
+import { DropReason, EventQueue, MAX_ATTEMPTS, MAX_QUEUED_EVENTS, PostResult, QueuedDelivery } from './queue';
 
 export type { ToolRecordOptions, ToolsAPI } from './tools';
 
@@ -17,8 +18,6 @@ export const SDK_VERSION = '0.5.2';
 
 const DEFAULT_BASE_URL = 'https://api.signalvault.io';
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-/** Longest Retry-After the SDK will wait out before retrying a background event once. */
-const MAX_RETRY_AFTER_MS = 5000;
 /** A repeated warning is printed at most once per this window. */
 const WARN_INTERVAL_MS = 60_000;
 
@@ -157,7 +156,7 @@ export interface SignalVaultConfig {
    */
   preflightTimeout?: number;
   /**
-   * Timeout (ms) for all background / post-flight event calls.
+   * Timeout (ms) for each attempt to send a background / post-flight event.
    * Default: 10000
    */
   timeout?: number;
@@ -228,30 +227,16 @@ const ALLOW: SignalVaultDecision = { decision: 'allow', violations: [], redactio
  * Set on the decision returned when no pre-flight decision was obtained.
  * 'record': the server may not have stored the request (network, timeout,
  * 5xx, invalid response), so it is recorded in the background and the
- * unchecked call still appears in the audit log. 'skip': the server refused
- * it (401/402/403/429/3xx), so a response event would be refused too.
+ * unchecked call still appears in the audit log. 'recorded': the server was
+ * over the app's rule-check rate limit and stored the request unchecked
+ * (429 with `recorded: true`), so the response is sent as usual. 'skip': the
+ * server refused it (401/402/403/other 429/3xx), so a response event would be
+ * refused too.
  */
 const PREFLIGHT_FAILED = Symbol('preflightFailed');
 /** Causes where re-sending the ai.request later can succeed. */
 const RECORDABLE_CAUSES = new Set(['timeout', 'network', '5xx', 'invalid-response']);
 const DECISIONS = new Set(['allow', 'warn', 'block', 'redact']);
-
-interface PostResult {
-  ok: boolean;
-  status: number;
-  response?: Response;
-}
-
-interface BackgroundOptions {
-  /**
-   * Add an event_id idempotency key. Off only for the fallback ai.request,
-   * which relies on the server's request_id de-duplication instead: the
-   * original pre-flight may have been stored before the client gave up.
-   */
-  eventId?: boolean;
-  /** Retry once on transient failures. Off for the manual tools.record() API. */
-  retry?: boolean;
-}
 
 /**
  * Checks the name rather than `instanceof Error`: fetch rejects with a
@@ -325,15 +310,6 @@ function anthropicUsage(...sources: any[]): Usage {
   if (Object.keys(cacheCreation).length) usage.cache_creation = cacheCreation;
   return usage;
 }
-
-function parseRetryAfterMs(response?: Response): number | null {
-  const raw = response?.headers?.get?.('retry-after');
-  if (!raw) return null;
-  const seconds = Number(raw);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
-}
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * The provider SDKs are optional peers, loaded only when their API key is
@@ -449,6 +425,9 @@ export class SignalVaultClient {
   private readonly anthropic: any | null;
   private readonly pending = new Set<Promise<unknown>>();
   private readonly lastWarned = new Map<string, number>();
+  private readonly queue: EventQueue;
+  /** Events dropped since the last warning for that reason was printed. */
+  private readonly droppedSinceWarning = new Map<DropReason, number>();
 
   constructor(config: SignalVaultConfig) {
     assertNodeEnvironment();
@@ -469,6 +448,13 @@ export class SignalVaultClient {
     this.preflightTimeout = config.preflightTimeout ?? 2000;
     this.bgTimeout = config.timeout ?? 10000;
     this.defaultMetadata = config.metadata ?? {};
+    this.queue = new EventQueue({
+      send: (body) => this.post(body, this.bgTimeout),
+      dropped: (reason, count, lastStatus) => this.reportDropped(reason, count, lastStatus),
+      debug: (message, detail) => {
+        if (this.debugMode) console.error(`[SignalVault] ${message}`, describeError(detail, this.svApiKey));
+      },
+    });
 
     this.openai = config.openaiApiKey ? loadOpenAI(config.openaiApiKey) : null;
     this.anthropic = config.anthropicApiKey ? loadAnthropic(config.anthropicApiKey) : null;
@@ -479,32 +465,73 @@ export class SignalVaultClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * Waits for in-flight audit events to finish sending, up to `timeoutMs`.
-   * Call before a short-lived process exits (scripts, serverless handlers),
-   * otherwise queued events are lost.
+   * Sends the queued audit events and waits until they are delivered, up to
+   * `timeoutMs`. Events waiting out a retry backoff are tried again at once.
+   * Call before a short-lived process exits or freezes (scripts, the end of
+   * every serverless invocation), otherwise queued events are lost. Events
+   * still undelivered at the deadline stay queued and keep being retried
+   * while the process runs.
    */
   async flush(timeoutMs = 5000): Promise<void> {
+    if (!(await this.drain(timeoutMs))) {
+      this.warn(
+        'flush-timeout',
+        `[SignalVault] flush() timed out with ${this.queue.size} audit event(s) still queued. ` +
+          'They are retried while the process runs, and lost if it exits.'
+      );
+    }
+  }
+
+  /**
+   * Flushes like flush(), then drops whatever is still undelivered (with a
+   * warning) and stops retrying it. The client can still be used afterwards.
+   */
+  async close(timeoutMs = 5000): Promise<void> {
+    await this.drain(timeoutMs);
+    this.queue.discard();
+  }
+
+  /** Waits for the queue and every tracked chain to finish. False at the deadline. */
+  private async drain(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (this.pending.size > 0) {
+    if (timeoutMs > 0) this.queue.expedite();
+    while (this.pending.size > 0 || this.queue.size > 0) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        this.warn('flush-timeout', `[SignalVault] flush() timed out with ${this.pending.size} event(s) still sending.`);
-        return;
-      }
+      if (remaining <= 0) return false;
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([
-        Promise.allSettled([...this.pending]),
+        Promise.allSettled([...this.pending, this.queue.whenIdle()]),
         new Promise((resolve) => {
           timer = setTimeout(resolve, remaining);
         }),
       ]);
       clearTimeout(timer);
     }
+    return true;
   }
 
-  /** Flushes pending events. The client can still be used afterwards. */
-  async close(timeoutMs = 5000): Promise<void> {
-    await this.flush(timeoutMs);
+  /**
+   * Queues a background event. `eventId: false` only for the fallback
+   * ai.request (see sendResponseEvent). `lost`: see EventQueue.add().
+   */
+  private enqueue(body: Record<string, unknown>, { eventId = true, lost = 1 } = {}): QueuedDelivery {
+    return this.queue.add(eventId ? { event_id: randomUUID(), ...body } : body, lost);
+  }
+
+  /** The one warning that events were lost, at most once a minute per reason, with the count since the last one. */
+  private reportDropped(reason: DropReason, count: number, lastStatus: number | null): void {
+    const total = (this.droppedSinceWarning.get(reason) ?? 0) + count;
+    this.droppedSinceWarning.set(reason, total);
+    const lost = `${total} audit event(s), which will not appear in your audit log`;
+    const message =
+      reason === 'overflow'
+        ? `[SignalVault] Audit event queue full (${MAX_QUEUED_EVENTS} events waiting to be sent): dropped the oldest ` +
+          `${lost}. Events queue up while SignalVault is unreachable or rate limiting this app.`
+        : reason === 'attempts'
+          ? `[SignalVault] Dropped ${lost}, after ${MAX_ATTEMPTS} delivery attempts ` +
+            `(last: ${lastStatus ?? 'no response'}).`
+          : `[SignalVault] close() dropped ${lost}: not delivered before the deadline.`;
+    if (this.warn(`dropped:${reason}`, message)) this.droppedSinceWarning.set(reason, 0);
   }
 
   /** Tracks a background promise so flush() can wait for it. Never rejects. */
@@ -519,13 +546,14 @@ export class SignalVaultClient {
     this.pending.add(tracked);
   }
 
-  /** Prints a warning, at most once per minute per key. Not gated on debug. */
-  private warn(key: string, message: string): void {
+  /** Prints a warning, at most once per minute per key. Not gated on debug. True if printed. */
+  private warn(key: string, message: string): boolean {
     const now = Date.now();
     const last = this.lastWarned.get(key);
-    if (last !== undefined && now - last < WARN_INTERVAL_MS) return;
+    if (last !== undefined && now - last < WARN_INTERVAL_MS) return false;
     this.lastWarned.set(key, now);
     console.warn(message);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -573,7 +601,9 @@ export class SignalVaultClient {
 
   /**
    * Manual tool recording API. Use when the wrapper isn't a fit (streaming
-   * tools, custom timing, post-hoc capture from logs).
+   * tools, custom timing, post-hoc capture from logs). Resolves after the
+   * first delivery attempt; if that one failed and can be retried, the event
+   * stays queued and is retried in the background like any other.
    *
    * @example
    * ```typescript
@@ -608,7 +638,8 @@ export class SignalVaultClient {
     return runWithContext(ctx, fn);
   }
 
-  private async sendToolCallEvent(opts: ToolRecordOptions, retry = true): Promise<void> {
+  /** `waitForDelivery: false` resolves after the first attempt (tools.record()). */
+  private async sendToolCallEvent(opts: ToolRecordOptions, waitForDelivery = true): Promise<void> {
     const metadata = { ...this.defaultMetadata, ...(opts.metadata ?? {}) };
 
     // Validate + sanitize before the first await, so the payload reflects the
@@ -644,10 +675,12 @@ export class SignalVaultClient {
       return;
     }
 
-    const result = await this.postBackground(body, { retry });
-    if (result && !result.ok && result.status >= 400 && result.status < 500 && result.status !== 429) {
+    const delivery = this.enqueue(body);
+    const result = await (waitForDelivery ? delivery.done : delivery.firstAttempt);
+    if (result.state === 'rejected' && result.status !== null && result.status >= 400 && result.status < 500) {
       // Surface 4xx unconditionally — those are usually misconfigurations
-      // (bad key, malformed payload) the user must know about.
+      // (bad key, malformed payload) the user must know about. 429 is retried,
+      // so it is never 'rejected'.
       console.warn(
         `[SignalVault] tool_call rejected with ${result.status}. ` +
           `Check your apiKey and event payload.`
@@ -964,28 +997,40 @@ export class SignalVaultClient {
 
   /**
    * Called when no decision could be obtained. Throws in failMode 'closed';
-   * otherwise warns (never silently) and allows.
+   * otherwise warns (never silently) and allows. `recorded`: the server
+   * stored the request without checking it.
    */
-  private unavailable(requestId: string, key: string, reason: string, status?: number): SignalVaultDecision {
+  private unavailable(
+    requestId: string,
+    key: string,
+    reason: string,
+    status?: number,
+    recorded = false
+  ): SignalVaultDecision {
     if (this.failMode === 'closed') {
       throw new SignalVaultUnavailableError(requestId, reason, status);
     }
     this.warn(
       `preflight:${key}`,
       `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent ` +
-        `to the provider unchecked (failMode: 'open').`
+        `to the provider unchecked (failMode: 'open').` +
+        (recorded ? ' They are still recorded in the audit log, marked as unchecked.' : '')
     );
     const decision: SignalVaultDecision = { ...ALLOW, violations: [], redactions: [] };
-    (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED] =
-      RECORDABLE_CAUSES.has(key) ? 'record' : 'skip';
+    (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED] = recorded
+      ? 'recorded'
+      : RECORDABLE_CAUSES.has(key)
+        ? 'record'
+        : 'skip';
     return decision;
   }
 
   /**
    * The ai.request body to record in the background when the pre-flight got
    * no decision, so an unchecked call is still in the audit log. Undefined
-   * when the pre-flight was recorded normally; null when the server refused
-   * it and no audit event should be sent.
+   * when the server stored the pre-flight (with a decision, or unchecked over
+   * the rule-check rate limit); null when the server refused it and no audit
+   * event should be sent.
    */
   private fallbackRequest(
     decision: SignalVaultDecision,
@@ -996,7 +1041,7 @@ export class SignalVaultClient {
     provider: string
   ): Record<string, unknown> | null | undefined {
     const failed = (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED];
-    if (failed === undefined) return undefined;
+    if (failed === undefined || failed === 'recorded') return undefined;
     if (failed === 'skip') return null;
     return {
       ...this.requestBody(requestId, model, messages, metadata, provider),
@@ -1022,13 +1067,7 @@ export class SignalVaultClient {
     };
   }
 
-  private async describeFailure(status: number, response?: Response): Promise<[string, string]> {
-    let body: any;
-    try {
-      body = await response?.json();
-    } catch {
-      body = undefined;
-    }
+  private describeFailure(status: number, body: any): [string, string] {
     const errorType = typeof body?.error === 'object' ? body.error?.type : body?.error;
 
     switch (status) {
@@ -1078,60 +1117,10 @@ export class SignalVaultClient {
   }
 
   /**
-   * POST for background events. Adds an `event_id` so a retry is never
-   * double-counted, and retries once on connection errors, 5xx, and 429 with a
-   * short Retry-After. Timeouts are not retried: the server may be slow rather
-   * than down, and a retry would double the time the event is held. Returns
-   * the last response, or null if nothing was received.
+   * The pre-flight check. Not queued: it is in the caller's critical path,
+   * and failMode decides what happens when it fails. `fail_mode` tells the
+   * server whether a request it cannot check is forwarded anyway.
    */
-  private async postBackground(
-    body: Record<string, unknown>,
-    { eventId = true, retry = true }: BackgroundOptions = {}
-  ): Promise<PostResult | null> {
-    const event = eventId ? { event_id: randomUUID(), ...body } : body;
-    let result: PostResult | null = null;
-    let retryDelayMs: number | null = null;
-
-    try {
-      result = await this.post(event, this.bgTimeout);
-      if (result.ok) return result;
-      if (result.status === 429) {
-        const retryAfter = parseRetryAfterMs(result.response);
-        retryDelayMs = retryAfter !== null && retryAfter <= MAX_RETRY_AFTER_MS ? retryAfter : null;
-      } else if (result.status >= 500) {
-        retryDelayMs = 250 + Math.random() * 500;
-      }
-    } catch (error) {
-      if (this.debugMode) {
-        console.error('[SignalVault] Event send failed:', describeError(error, this.svApiKey));
-      }
-      if (!isTimeout(error)) retryDelayMs = 250 + Math.random() * 500;
-    }
-
-    if (retry && retryDelayMs !== null) {
-      await sleep(retryDelayMs);
-      try {
-        result = await this.post(event, this.bgTimeout);
-        if (result.ok) return result;
-      } catch (error) {
-        if (this.debugMode) {
-          console.error('[SignalVault] Event retry failed:', describeError(error, this.svApiKey));
-        }
-      }
-    }
-
-    this.logUndelivered(result);
-    return result;
-  }
-
-  private logUndelivered(result: PostResult | null): void {
-    if (result?.status === 429) {
-      this.warn('bg-429', '[SignalVault] Rate limited (429): audit events are being dropped.');
-    } else if (this.debugMode) {
-      console.error('[SignalVault] Event not delivered:', result ? result.status : 'no response');
-    }
-  }
-
   private async sendRequest(
     requestId: string,
     model: string,
@@ -1142,7 +1131,10 @@ export class SignalVaultClient {
     let result: PostResult;
     try {
       result = await this.post(
-        this.requestBody(requestId, model, messages, metadata, provider),
+        {
+          ...this.requestBody(requestId, model, messages, metadata, provider),
+          payload: { messages, fail_mode: this.failMode },
+        },
         this.preflightTimeout
       );
     } catch (error) {
@@ -1160,7 +1152,20 @@ export class SignalVaultClient {
     }
 
     if (!result.ok) {
-      const [key, reason] = await this.describeFailure(result.status, result.response);
+      let body: any;
+      try {
+        body = await result.response?.json();
+      } catch {
+        body = undefined;
+      }
+      if (result.status === 429 && body?.recorded === true) {
+        // Over the app's rule-check rate limit: the server stored the
+        // request, with no rules run, but there is still no decision.
+        return this.unavailable(
+          requestId, '429-recorded', 'SignalVault rule-check rate limit reached (429)', 429, true
+        );
+      }
+      const [key, reason] = this.describeFailure(result.status, body);
       return this.unavailable(requestId, key, reason, result.status);
     }
 
@@ -1201,10 +1206,14 @@ export class SignalVaultClient {
     if (fallbackRequest === null) return;
     if (fallbackRequest) {
       // Must land before the response: the server rejects an ai.response whose
-      // ai.request it has not stored.
-      await this.postBackground(fallbackRequest, { eventId: false });
+      // ai.request it has not stored. No event_id: the server de-duplicates it
+      // by request_id, which also covers a pre-flight it stored before the
+      // client gave up on it, and every retry.
+      const request = await this.enqueue(fallbackRequest, { eventId: false, lost: 2 }).done;
+      // The response is not sent without its request: the server would refuse it.
+      if (request.state === 'dropped') return;
     }
-    await this.postBackground({
+    await this.enqueue({
       type: 'ai.response',
       request_id: requestId,
       environment: this.svEnvironment,
@@ -1215,8 +1224,9 @@ export class SignalVaultClient {
         output,
         usage,
       },
-    });
+    }).done;
   }
+
 
   /**
    * Mirror mode: records the request, then the response. Sequential on
@@ -1240,12 +1250,13 @@ export class SignalVaultClient {
       metadata,
     };
 
-    await this.postBackground({
-      ...base,
-      type: 'ai.request',
-      payload: { messages, monitor_mode: true },
-    });
-    await this.postBackground({
+    const request = await this.enqueue(
+      { ...base, type: 'ai.request', payload: { messages, monitor_mode: true } },
+      { lost: 2 }
+    ).done;
+    // The response is not sent without its request: the server would refuse it.
+    if (request.state === 'dropped') return;
+    await this.enqueue({
       ...base,
       type: 'ai.response',
       payload: {
@@ -1253,7 +1264,7 @@ export class SignalVaultClient {
         usage,
         monitor_mode: true,
       },
-    });
+    }).done;
   }
 }
 
