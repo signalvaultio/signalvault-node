@@ -219,21 +219,43 @@ Audit events (responses, tool calls, mirror-mode events, and the background reco
 - **Retries.** A send that fails with a connection error, a timeout, a 5xx or a 429 is retried, up to 6 attempts over about two minutes. The wait doubles each time: 4, 8, 16, 32 and 60 seconds, each shortened by up to a quarter at random so that clients do not retry in step. When SignalVault sends `Retry-After`, the SDK waits that long instead, up to 60 seconds. Other 4xx responses are not retried.
 - **No double counting.** Each event carries an `event_id` that stays the same across retries, so SignalVault stores it once. The fallback request is de-duplicated by its `request_id`.
 - **Order.** A response is sent after its request has been stored. If the request is dropped, its response is not sent.
-- **Dropping is the last resort.** Up to 1,000 events can wait to be sent. Beyond that the oldest waiting event is dropped, and an event is also dropped after its last attempt. Either way the SDK prints a warning with the number of events lost (at most once a minute per cause, whether or not `debug` is on). A dropped event is not in your audit log.
+- **Dropping is the last resort.** Up to 1,000 events can wait to be sent. Beyond that the oldest waiting event is dropped. An event is also dropped after its last attempt, and when the process exits before the exit flush (below) could deliver it. A dropped event is not in your audit log.
 - **`tools.record()`** resolves after the first attempt. If that attempt failed and can be retried, the event stays in the queue and is retried like the others.
 
-The queue never keeps your process alive: a pending retry does not stop Node from exiting. Use `flush()` to wait for it.
+The retry timer never keeps your process alive on its own. When the process is about to exit, the exit flush below gives queued events a last chance.
+
+### What is logged when events are dropped
+
+Every drop prints one line with `console.warn`, whether or not `debug` is on, with the number of events, the cause and the id of each event, so you can find them in your own logs:
+
+```
+[SignalVault] Dropped 1 audit event(s) (retries exhausted: 6 attempts, last: 503): event_id 9dcf632e-271b-48b7-a772-b9afeee28fbb. Dropped events are not in your audit log. ...
+```
+
+These lines are never rate limited; only the explanation after the ids is printed at most once a minute per cause. An event is named by its `event_id`. The background record of a request whose check failed has no `event_id`, so it is named by its `request_id` and marked as such. When a request is dropped, the line also says that its response was not sent; the count includes it.
+
+`client.droppedEvents` counts the events dropped since the client was created, by cause:
+
+```typescript
+client.droppedEvents; // { queueFull: 0, retriesExhausted: 0, exit: 0 }
+```
+
+- `queueFull`: dropped because 1,000 events were already waiting to be sent.
+- `retriesExhausted`: dropped after the last of 6 attempts failed.
+- `exit`: still undelivered when the exit flush reached `exitFlushTimeout`.
+
+The object is a snapshot; read the property again for current counts.
 
 ## Shutting Down
 
-Before a short-lived process exits, wait for the queue:
+**Call `flush()` before a short-lived process ends.** Scripts, CLIs, jobs and serverless handlers should not rely on the exit flush:
 
 ```typescript
 await client.flush();       // waits up to 5 seconds
 await client.flush(10_000); // or up to 10
 ```
 
-`flush()` sends every queued event at once, including those waiting out a retry, and resolves when all of them are delivered or the deadline passes. At the deadline it prints a warning; the events still queued stay in the queue and keep being retried while the process runs.
+`flush()` sends every queued event at once, including those waiting out a retry, and resolves when all of them are delivered or the deadline passes. At the deadline it prints a warning naming the events still queued; they stay in the queue and keep being retried while the process runs.
 
 **Serverless functions** (AWS Lambda, Vercel, Google Cloud Functions and similar) are frozen or stopped as soon as the handler returns, so call `flush()` at the end of every invocation, not only at shutdown. Create the client outside the handler, so a warm instance reuses it:
 
@@ -258,7 +280,16 @@ export async function handler(event: { prompt: string }) {
 
 The time `flush()` takes counts towards your function's duration: when SignalVault is reachable, it is the time to send the events still in flight. Pass a shorter deadline to bound it.
 
-`close()` flushes the same way, then drops whatever is still undelivered, with a warning, and stops retrying it. Use it when a long-running process shuts down. The client can still be used afterwards.
+**Exit flush.** When a Node process is about to exit on its own because it has nothing left to do (Node's `beforeExit` event), the SDK flushes every client that still has events queued, for up to `exitFlushTimeout` (default 10,000 ms; `0` turns it off). Events still undelivered then are dropped and logged with their ids, and counted under `droppedEvents.exit`. `beforeExit` does **not** fire when you call `process.exit()`, when the process is killed by a signal (for example `SIGTERM` or Ctrl+C), on an uncaught exception, or when a serverless platform freezes the process. In those cases only an explicit `flush()` delivers queued events: call it before `process.exit()` and in your signal handlers.
+
+```typescript
+process.on('SIGTERM', async () => {
+  await client.close();
+  process.exit(0);
+});
+```
+
+`close()` flushes like `flush()`, with a default deadline of 10 seconds. It drops nothing: events still undelivered at the deadline stay queued and keep being retried while the process runs, and a warning names how many there are and their ids. The client can still be used afterwards.
 
 ## Mirror Mode
 
@@ -300,6 +331,7 @@ const client = new SignalVaultClient({
   failMode: 'open',                 // 'open' | 'closed' — see "When SignalVault Is Unavailable"
   preflightTimeout: 2000,           // ms
   timeout: 10000,                   // ms, per attempt to send an audit event
+  exitFlushTimeout: 10000,          // ms to deliver queued events when the process exits on its own; 0 = off
   metadata: {},                     // Default metadata for all events
 });
 ```

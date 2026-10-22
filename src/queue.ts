@@ -26,10 +26,19 @@ export interface PostResult {
  * - `delivered`: the server accepted the event (2xx).
  * - `rejected`: the server refused it (3xx, or 4xx other than 429); not retried.
  * - `retrying`: only from `firstAttempt`: it failed and is queued for a retry.
- * - `dropped`: lost: the queue overflowed, the attempts ran out, or close() was called.
+ * - `dropped`: lost: the queue overflowed, the attempts ran out, or the
+ *   process was exiting and the exit flush reached its deadline.
  */
 export type DeliveryState = 'delivered' | 'rejected' | 'retrying' | 'dropped';
-export type DropReason = 'overflow' | 'attempts' | 'close';
+export type DropReason = 'overflow' | 'attempts' | 'exit';
+
+/** One dropped event, as handed to QueueHooks.dropped. */
+export interface DroppedEntry {
+  body: Record<string, unknown>;
+  /** Events lost with it, itself included (see EventQueue.add()). */
+  lost: number;
+  lastStatus: number | null;
+}
 
 export interface Delivery {
   state: DeliveryState;
@@ -48,8 +57,10 @@ export interface QueuedDelivery {
 export interface QueueHooks {
   /** Sends one event. Rejects on network errors and timeouts. */
   send(body: Record<string, unknown>): Promise<PostResult>;
-  /** Called when events are lost: `count` counts the events dropped with them (see add()). */
-  dropped(reason: DropReason, count: number, lastStatus: number | null): void;
+  /** Called whenever events are lost, with every one of them. */
+  dropped(reason: DropReason, entries: DroppedEntry[]): void;
+  /** Called when the queue goes from empty to not empty (true) and back (false). */
+  busy(busy: boolean): void;
   /** Debug output; only printed with `debug: true`. */
   debug(message: string, detail: unknown): void;
 }
@@ -63,7 +74,7 @@ interface Entry {
   attempts: number;
   readyAt: number;
   lastStatus: number | null;
-  /** Set by close() on events in flight: their attempt is the last. */
+  /** Set by abandon() on events in flight: their attempt is the last. */
   noRetry: boolean;
   first?: (delivery: Delivery) => void;
   done: (delivery: Delivery) => void;
@@ -96,6 +107,7 @@ export class EventQueue {
   private timerAt = Infinity;
   /** Shared by every whenIdle() caller until the queue is next idle. */
   private idle: { promise: Promise<void>; resolve: () => void } | null = null;
+  private busy = false;
 
   constructor(private readonly hooks: QueueHooks) {}
 
@@ -116,6 +128,10 @@ export class EventQueue {
     const firstAttempt = new Promise<Delivery>((resolve) => (first = resolve));
     const settled = new Promise<Delivery>((resolve) => (done = resolve));
     this.insert({ seq: this.seq++, body, lost, attempts: 0, readyAt: 0, lastStatus: null, noRetry: false, first, done });
+    if (!this.busy) {
+      this.busy = true;
+      this.hooks.busy(true);
+    }
     this.pump();
     return { firstAttempt, done: settled };
   }
@@ -126,20 +142,21 @@ export class EventQueue {
     this.pump();
   }
 
+  /** Bodies of the events waiting or in flight, oldest first. */
+  pendingBodies(): Array<Record<string, unknown>> {
+    return [...this.sending, ...this.waiting].sort((a, b) => a.seq - b.seq).map((e) => e.body);
+  }
+
   /**
    * Drops every waiting event and stops retrying the ones in flight: their
-   * current attempt is their last.
+   * current attempt is their last. Only for a process that is exiting.
    */
-  discard(): void {
+  abandon(reason: DropReason): void {
     const dropped = this.waiting.splice(0);
     this.clearTimer();
     for (const entry of this.sending) entry.noRetry = true;
-    let lost = 0;
-    for (const entry of dropped) {
-      this.settle(entry, { state: 'dropped', status: entry.lastStatus, reason: 'close' });
-      lost += entry.lost;
-    }
-    if (lost) this.hooks.dropped('close', lost, null);
+    for (const entry of dropped) this.settle(entry, { state: 'dropped', status: entry.lastStatus, reason });
+    if (dropped.length) this.hooks.dropped(reason, dropped.map(toDropped));
     this.notifyIfIdle();
   }
 
@@ -162,7 +179,7 @@ export class EventQueue {
     while (this.waiting.length > MAX_QUEUED_EVENTS) {
       const oldest = this.waiting.shift()!;
       this.settle(oldest, { state: 'dropped', status: oldest.lastStatus, reason: 'overflow' });
-      this.hooks.dropped('overflow', oldest.lost, oldest.lastStatus);
+      this.hooks.dropped('overflow', [toDropped(oldest)]);
     }
   }
 
@@ -228,9 +245,9 @@ export class EventQueue {
       this.hooks.debug('Event not delivered:', status);
       this.settle(entry, { state: 'rejected', status });
     } else if (entry.noRetry || entry.attempts >= MAX_ATTEMPTS) {
-      const reason: DropReason = entry.noRetry ? 'close' : 'attempts';
+      const reason: DropReason = entry.noRetry ? 'exit' : 'attempts';
       this.settle(entry, { state: 'dropped', status, reason });
-      this.hooks.dropped(reason, entry.lost, status);
+      this.hooks.dropped(reason, [toDropped(entry)]);
     } else {
       entry.readyAt = Date.now() + retryDelayMs(entry.attempts, retryAfterMs);
       entry.first?.({ state: 'retrying', status });
@@ -253,10 +270,19 @@ export class EventQueue {
   }
 
   private notifyIfIdle(): void {
-    if (this.size > 0 || !this.idle) return;
+    if (this.size > 0) return;
+    if (this.busy) {
+      this.busy = false;
+      this.hooks.busy(false);
+    }
+    if (!this.idle) return;
     this.idle.resolve();
     this.idle = null;
   }
+}
+
+function toDropped(entry: Entry): DroppedEntry {
+  return { body: entry.body, lost: entry.lost, lastStatus: entry.lastStatus };
 }
 
 /**
