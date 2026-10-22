@@ -9,7 +9,15 @@ import {
   validateToolName,
   wrapTool,
 } from './tools';
-import { DropReason, EventQueue, MAX_ATTEMPTS, MAX_QUEUED_EVENTS, PostResult, QueuedDelivery } from './queue';
+import {
+  DropReason,
+  DroppedEntry,
+  EventQueue,
+  MAX_ATTEMPTS,
+  MAX_QUEUED_EVENTS,
+  PostResult,
+  QueuedDelivery,
+} from './queue';
 
 export type { ToolRecordOptions, ToolsAPI } from './tools';
 
@@ -161,11 +169,35 @@ export interface SignalVaultConfig {
    */
   timeout?: number;
   /**
+   * When the process is about to exit on its own (Node's `beforeExit`: the
+   * event loop has run dry), wait up to this long (ms) for queued audit
+   * events to be delivered. 0 disables it. `beforeExit` does not fire on
+   * `process.exit()`, on signals or when a serverless platform freezes the
+   * process: call flush() yourself there. Default: 10000
+   */
+  exitFlushTimeout?: number;
+  /**
    * Default metadata attached to every event. Can be overridden per-call.
    * Use for user_id, feature, workspace_id, etc.
    */
   metadata?: Record<string, unknown>;
 }
+
+/** Audit events the SDK dropped, by cause, since the client was created. See `droppedEvents`. */
+export interface DroppedEvents {
+  /** Dropped because 1,000 events were already waiting to be sent (oldest first). */
+  queueFull: number;
+  /** Dropped after the last of 6 delivery attempts failed. */
+  retriesExhausted: number;
+  /** Still undelivered when the exit flush (`exitFlushTimeout`) reached its deadline. */
+  exit: number;
+}
+
+const DROP_COUNTERS: Record<DropReason, keyof DroppedEvents> = {
+  overflow: 'queueFull',
+  attempts: 'retriesExhausted',
+  exit: 'exit',
+};
 
 export interface SignalVaultViolation {
   rule_id?: string;
@@ -237,6 +269,19 @@ const PREFLIGHT_FAILED = Symbol('preflightFailed');
 /** Causes where re-sending the ai.request later can succeed. */
 const RECORDABLE_CAUSES = new Set(['timeout', 'network', '5xx', 'invalid-response']);
 const DECISIONS = new Set(['allow', 'warn', 'block', 'redact']);
+
+/**
+ * How a dropped or undelivered event is named in a warning. The fallback
+ * ai.request has no event_id, so it is named by its request_id. `lost` above
+ * 1: an ai.response was waiting for this request and is not sent.
+ */
+function describeEvent(body: Record<string, unknown>, lost: number): string {
+  const name =
+    typeof body.event_id === 'string'
+      ? `event_id ${body.event_id}`
+      : `request_id ${String(body.request_id)} (fallback ai.request, which has no event_id)`;
+  return lost > 1 ? `${name} and its ai.response, not sent` : name;
+}
 
 /**
  * Checks the name rather than `instanceof Error`: fetch rejects with a
@@ -425,9 +470,18 @@ export class SignalVaultClient {
   private readonly anthropic: any | null;
   private readonly pending = new Set<Promise<unknown>>();
   private readonly lastWarned = new Map<string, number>();
+  private readonly exitFlushTimeout: number;
   private readonly queue: EventQueue;
-  /** Events dropped since the last warning for that reason was printed. */
-  private readonly droppedSinceWarning = new Map<DropReason, number>();
+  private readonly dropped: DroppedEvents = { queueFull: 0, retriesExhausted: 0, exit: 0 };
+  private exitFlushing = false;
+
+  /**
+   * Clients with audit events queued, flushed on `beforeExit`. A client is
+   * held only while its queue is not empty, so this never keeps an unused
+   * client alive.
+   */
+  private static readonly exitClients = new Set<SignalVaultClient>();
+  private static exitHookInstalled = false;
 
   constructor(config: SignalVaultConfig) {
     assertNodeEnvironment();
@@ -448,9 +502,11 @@ export class SignalVaultClient {
     this.preflightTimeout = config.preflightTimeout ?? 2000;
     this.bgTimeout = config.timeout ?? 10000;
     this.defaultMetadata = config.metadata ?? {};
+    this.exitFlushTimeout = config.exitFlushTimeout ?? 10_000;
     this.queue = new EventQueue({
       send: (body) => this.post(body, this.bgTimeout),
-      dropped: (reason, count, lastStatus) => this.reportDropped(reason, count, lastStatus),
+      dropped: (reason, entries) => this.reportDropped(reason, entries),
+      busy: (busy) => this.onQueueBusy(busy),
       debug: (message, detail) => {
         if (this.debugMode) console.error(`[SignalVault] ${message}`, describeError(detail, this.svApiKey));
       },
@@ -474,21 +530,37 @@ export class SignalVaultClient {
    */
   async flush(timeoutMs = 5000): Promise<void> {
     if (!(await this.drain(timeoutMs))) {
-      this.warn(
-        'flush-timeout',
-        `[SignalVault] flush() timed out with ${this.queue.size} audit event(s) still queued. ` +
-          'They are retried while the process runs, and lost if it exits.'
-      );
+      this.warn('flush-timeout', `[SignalVault] flush() timed out with ${this.stillQueued()}`);
     }
   }
 
   /**
-   * Flushes like flush(), then drops whatever is still undelivered (with a
-   * warning) and stops retrying it. The client can still be used afterwards.
+   * Flushes like flush(), with a longer default deadline. Nothing is dropped:
+   * events still undelivered at the deadline stay queued and keep being
+   * retried while the process runs, and a warning names them. The client can
+   * still be used afterwards.
    */
-  async close(timeoutMs = 5000): Promise<void> {
-    await this.drain(timeoutMs);
-    this.queue.discard();
+  async close(timeoutMs = 10_000): Promise<void> {
+    if (!(await this.drain(timeoutMs))) {
+      console.warn(`[SignalVault] close() timed out with ${this.stillQueued()}`);
+    }
+  }
+
+  /**
+   * Audit events dropped so far, by cause. Every drop is also logged with
+   * console.warn, with the ids of the events dropped.
+   */
+  get droppedEvents(): Readonly<DroppedEvents> {
+    return { ...this.dropped };
+  }
+
+  /** "N audit event(s) still queued: <ids>. ..." for the flush() and close() warnings. */
+  private stillQueued(): string {
+    const ids = this.queue.pendingBodies().map((body) => describeEvent(body, 1));
+    return (
+      `${ids.length} audit event(s) still queued: ${ids.join(', ')}. ` +
+      'They stay queued and are retried while the process runs; they are lost if it exits first.'
+    );
   }
 
   /** Waits for the queue and every tracked chain to finish. False at the deadline. */
@@ -518,20 +590,63 @@ export class SignalVaultClient {
     return this.queue.add(eventId ? { event_id: randomUUID(), ...body } : body, lost);
   }
 
-  /** The one warning that events were lost, at most once a minute per reason, with the count since the last one. */
-  private reportDropped(reason: DropReason, count: number, lastStatus: number | null): void {
-    const total = (this.droppedSinceWarning.get(reason) ?? 0) + count;
-    this.droppedSinceWarning.set(reason, total);
-    const lost = `${total} audit event(s), which will not appear in your audit log`;
-    const message =
+  /**
+   * Counts and logs every drop, with the ids of the events dropped: one
+   * console.warn line per drop, never rate limited. The explanation after
+   * the ids is added at most once a minute per cause.
+   */
+  private reportDropped(reason: DropReason, entries: DroppedEntry[]): void {
+    const count = entries.reduce((sum, entry) => sum + entry.lost, 0);
+    this.dropped[DROP_COUNTERS[reason]] += count;
+    const cause =
       reason === 'overflow'
-        ? `[SignalVault] Audit event queue full (${MAX_QUEUED_EVENTS} events waiting to be sent): dropped the oldest ` +
-          `${lost}. Events queue up while SignalVault is unreachable or rate limiting this app.`
+        ? `queue full: ${MAX_QUEUED_EVENTS} events were waiting to be sent`
         : reason === 'attempts'
-          ? `[SignalVault] Dropped ${lost}, after ${MAX_ATTEMPTS} delivery attempts ` +
-            `(last: ${lastStatus ?? 'no response'}).`
-          : `[SignalVault] close() dropped ${lost}: not delivered before the deadline.`;
-    if (this.warn(`dropped:${reason}`, message)) this.droppedSinceWarning.set(reason, 0);
+          ? `retries exhausted: ${MAX_ATTEMPTS} attempts, last: ${entries[0].lastStatus ?? 'no response'}`
+          : `process exiting: not delivered within exitFlushTimeout (${this.exitFlushTimeout} ms)`;
+    const ids = entries.map((entry) => describeEvent(entry.body, entry.lost)).join(', ');
+    const hint = this.shouldWarn(`dropped:${reason}`)
+      ? ' Dropped events are not in your audit log. ' +
+        (reason === 'exit'
+          ? 'Call flush() before the process ends to deliver them.'
+          : 'Events queue up while SignalVault is unreachable or rate limiting this app.') +
+        ' Counts by cause: client.droppedEvents.'
+      : '';
+    console.warn(`[SignalVault] Dropped ${count} audit event(s) (${cause}): ${ids}.${hint}`);
+  }
+
+  /** Keeps this client in the beforeExit set while it has events queued. */
+  private onQueueBusy(busy: boolean): void {
+    if (!busy) {
+      SignalVaultClient.exitClients.delete(this);
+    } else if (this.exitFlushTimeout > 0) {
+      SignalVaultClient.exitClients.add(this);
+      SignalVaultClient.installExitHook();
+    }
+  }
+
+  /**
+   * One `beforeExit` listener per process, for every client. `beforeExit`
+   * fires when the event loop is empty; the flush gives it work again, so it
+   * fires once more afterwards, by then with nothing left to do.
+   */
+  private static installExitHook(): void {
+    if (SignalVaultClient.exitHookInstalled) return;
+    SignalVaultClient.exitHookInstalled = true;
+    process.on('beforeExit', () => {
+      for (const client of [...SignalVaultClient.exitClients]) void client.exitFlush();
+    });
+  }
+
+  /** Flushes for up to exitFlushTimeout; what is left then is dropped, logged and counted. */
+  private async exitFlush(): Promise<void> {
+    if (this.exitFlushing) return;
+    this.exitFlushing = true;
+    try {
+      if (!(await this.drain(this.exitFlushTimeout))) this.queue.abandon('exit');
+    } finally {
+      this.exitFlushing = false;
+    }
   }
 
   /** Tracks a background promise so flush() can wait for it. Never rejects. */
@@ -546,13 +661,17 @@ export class SignalVaultClient {
     this.pending.add(tracked);
   }
 
-  /** Prints a warning, at most once per minute per key. Not gated on debug. True if printed. */
-  private warn(key: string, message: string): boolean {
+  /** Prints a warning, at most once per minute per key. Not gated on debug. */
+  private warn(key: string, message: string): void {
+    if (this.shouldWarn(key)) console.warn(message);
+  }
+
+  /** True at most once per minute per key, and records that it was. */
+  private shouldWarn(key: string): boolean {
     const now = Date.now();
     const last = this.lastWarned.get(key);
     if (last !== undefined && now - last < WARN_INTERVAL_MS) return false;
     this.lastWarned.set(key, now);
-    console.warn(message);
     return true;
   }
 

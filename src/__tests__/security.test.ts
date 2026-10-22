@@ -52,7 +52,7 @@ function openaiStub(chunks?: unknown[]) {
   };
 }
 
-/** Clients from makeClient(), closed after each test so no retry outlives it. */
+/** Clients from makeClient(); their queues are emptied after each test so no retry outlives it. */
 const clients: SignalVaultClient[] = [];
 
 function makeClient(config: Partial<SignalVaultConfig> = {}) {
@@ -75,14 +75,15 @@ function fakeTimers() {
 
 const allow = { status: 200, body: { decision: 'allow', violations: [], redactions: [] } };
 const messages = [{ role: 'user' as const, content: 'hi' }];
-const dropWarnings = () => warnSpy.mock.calls.map((c) => c[0]).filter((m) => /[Dd]ropped/.test(m));
+const dropWarnings = (): string[] => warnSpy.mock.calls.map((c) => c[0]).filter((m) => /Dropped/.test(m));
+const responsesOf = (f: ReturnType<typeof stubFetch>) => f.calls.filter((c) => c.body.type === 'ai.response');
 
 let warnSpy: jest.SpyInstance;
 beforeEach(() => {
   warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(async () => {
-  for (const client of clients.splice(0)) await client.close(0);
+  for (const client of clients.splice(0)) (client as any).queue.abandon('exit');
   jest.restoreAllMocks();
   jest.useRealTimers();
 });
@@ -742,8 +743,6 @@ describe('failure classification', () => {
 describe('background retry policy', () => {
   beforeEach(fakeTimers);
 
-  const responsesOf = (f: ReturnType<typeof stubFetch>) => f.calls.filter((c) => c.body.type === 'ai.response');
-
   it('retries 5xx with exponential backoff, keeping the event_id', async () => {
     const f = stubFetch({
       'ai.request': [allow],
@@ -821,7 +820,13 @@ describe('background retry policy', () => {
     await jest.advanceTimersByTimeAsync(60_000);
     expect(responsesOf(f)).toHaveLength(6);
     expect(dropWarnings()).toHaveLength(1);
-    expect(dropWarnings()[0]).toMatch(/Dropped 1 audit event\(s\).*not appear in your audit log.*6 delivery attempts \(last: 503\)/);
+    expect(dropWarnings()[0]).toBe(
+      '[SignalVault] Dropped 1 audit event(s) (retries exhausted: 6 attempts, last: 503): ' +
+        `event_id ${responsesOf(f)[0].body.event_id}. Dropped events are not in your audit log. ` +
+        'Events queue up while SignalVault is unreachable or rate limiting this app. ' +
+        'Counts by cause: client.droppedEvents.'
+    );
+    expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 1, exit: 0 });
 
     await jest.advanceTimersByTimeAsync(300_000);
     expect(responsesOf(f)).toHaveLength(6);
@@ -860,7 +865,47 @@ describe('background retry policy', () => {
     await jest.advanceTimersByTimeAsync(300_000);
     expect(f.types()).toEqual(Array(6).fill('ai.request'));
     expect(dropWarnings()).toHaveLength(1);
-    expect(dropWarnings()[0]).toMatch(/Dropped 2 audit event\(s\)/);
+    expect(dropWarnings()[0]).toMatch(
+      new RegExp(`^\\[SignalVault\\] Dropped 2 audit event\\(s\\) \\(retries exhausted: 6 attempts, last: 503\\): ` +
+        `event_id ${f.calls[0].body.event_id} and its ai.response, not sent\\.`)
+    );
+    expect(client.droppedEvents.retriesExhausted).toBe(2);
+  });
+
+  it('logs a dropped fallback ai.request by its request_id, which it has instead of an event_id', async () => {
+    const f = stubFetch({ 'ai.request': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(f.types()).toEqual(Array(7).fill('ai.request')); // the pre-flight, then 6 attempts
+    expect(dropWarnings()).toHaveLength(1);
+    expect(dropWarnings()[0]).toContain(
+      `Dropped 2 audit event(s) (retries exhausted: 6 attempts, last: 503): request_id ${f.calls[0].body.request_id} ` +
+        '(fallback ai.request, which has no event_id) and its ai.response, not sent.'
+    );
+    expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 2, exit: 0 });
+  });
+
+  it('logs every drop with its id; only the explanation is rate limited', async () => {
+    const f = stubFetch({ 'ai.request': [allow, allow], 'ai.response': Array(20).fill({ status: 503 }) });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(300_000);
+
+    const ids = [...new Set(responsesOf(f).map((c) => c.body.event_id))];
+    expect(ids).toHaveLength(2);
+    expect(dropWarnings()).toHaveLength(2);
+    ids.forEach((id) => expect(dropWarnings().some((m) => m.includes(`event_id ${id}.`))).toBe(true));
+    expect(dropWarnings().filter((m) => m.includes('not in your audit log'))).toHaveLength(1);
+    expect(client.droppedEvents.retriesExhausted).toBe(2);
+  });
+
+  it('droppedEvents is a read-only snapshot', () => {
+    const { client } = makeClient();
+    const counts = client.droppedEvents as { exit: number };
+    counts.exit = 99;
+    expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 0, exit: 0 });
   });
 
   it('tools.record() resolves after the first attempt; the event is retried in the background', async () => {
@@ -888,7 +933,7 @@ describe('retry timer', () => {
 });
 
 describe('queue overflow', () => {
-  it('drops the oldest waiting event beyond 1,000, with a rate-limited warning that counts them', async () => {
+  it('drops the oldest waiting event beyond 1,000, logging each with its event_id, and counts them', async () => {
     fakeTimers();
     let hold = true;
     const held: Array<() => void> = [];
@@ -900,23 +945,31 @@ describe('queue overflow', () => {
     });
     const { client } = makeClient();
     const record = (n: number) => void client.tools.record({ toolName: 't', durationMs: n });
+    const queued = () => (client as any).queue.pendingBodies() as Array<{ event_id: string; payload: any }>;
+    const idOf = (n: number) => queued().find((b) => b.payload.duration_ms === n)!.event_id;
 
     // 16 in flight (held), then 1,000 waiting: full, nothing dropped yet.
     for (let n = 0; n < 1016; n++) record(n);
     expect(sent).toHaveLength(16);
     expect(dropWarnings()).toEqual([]);
 
+    const dropped = [idOf(16), idOf(17), idOf(18)];
     record(1016); // drops 16, the oldest waiting
-    expect(dropWarnings()).toHaveLength(1);
-    expect(dropWarnings()[0]).toMatch(
-      /queue full \(1000 events waiting to be sent\): dropped the oldest 1 audit event\(s\), which will not appear/
+    expect(dropWarnings()).toEqual([
+      '[SignalVault] Dropped 1 audit event(s) (queue full: 1000 events were waiting to be sent): ' +
+        `event_id ${dropped[0]}. Dropped events are not in your audit log. ` +
+        'Events queue up while SignalVault is unreachable or rate limiting this app. ' +
+        'Counts by cause: client.droppedEvents.',
+    ]);
+    record(1017); // drops 17: logged with its id, without the explanation
+    expect(dropWarnings()[1]).toBe(
+      `[SignalVault] Dropped 1 audit event(s) (queue full: 1000 events were waiting to be sent): event_id ${dropped[1]}.`
     );
-    record(1017); // drops 17; the warning is rate limited
-    expect(dropWarnings()).toHaveLength(1);
     jest.setSystemTime(Date.now() + 60_000);
-    record(1018); // drops 18
-    expect(dropWarnings()).toHaveLength(2);
-    expect(dropWarnings()[1]).toMatch(/dropped the oldest 2 audit event\(s\)/);
+    record(1018); // drops 18; the explanation is due again
+    expect(dropWarnings()).toHaveLength(3);
+    expect(dropWarnings()[2]).toContain(`event_id ${dropped[2]}. Dropped events are not in your audit log.`);
+    expect(client.droppedEvents).toEqual({ queueFull: 3, retriesExhausted: 0, exit: 0 });
 
     hold = false;
     held.splice(0).forEach((release) => release());
@@ -957,22 +1010,119 @@ describe('flush() and close()', () => {
     expect(f.types().filter((t) => t === 'ai.response')).toHaveLength(attempts + 1);
   });
 
-  it('close() drops what is still undelivered at the deadline, says so, and stops retrying', async () => {
-    const f = stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
+  it('close() drops nothing: at the deadline it names what is still queued, which keeps being retried', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [...Array(3).fill({ status: 503 }), { status: 200 }] });
     const { client } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
     await jest.advanceTimersByTimeAsync(0);
+    const id = responsesOf(f)[0].body.event_id;
 
     const closed = client.close(1_000);
     await jest.advanceTimersByTimeAsync(1_000);
     await closed;
-    expect(dropWarnings()).toEqual([
-      expect.stringMatching(/close\(\) dropped 1 audit event\(s\), which will not appear.*before the deadline/),
-    ]);
-    const attempts = f.types().length;
-    await jest.advanceTimersByTimeAsync(300_000);
-    expect(f.types()).toHaveLength(attempts);
+    expect(warnSpy.mock.calls.map((c) => c[0])).toContain(
+      `[SignalVault] close() timed out with 1 audit event(s) still queued: event_id ${id}. ` +
+        'They stay queued and are retried while the process runs; they are lost if it exits first.'
+    );
+    expect(dropWarnings()).toEqual([]);
+    expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 0, exit: 0 });
+    expect((client as any).queue.size).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(8_000 + 16_000);
+    expect(responsesOf(f)).toHaveLength(4); // delivered on the fourth attempt
     expect((client as any).queue.size).toBe(0);
+  });
+
+  it('close() waits 10 seconds by default', async () => {
+    stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    let done = false;
+    const closed = client.close().then(() => (done = true));
+    await jest.advanceTimersByTimeAsync(9_999);
+    expect(done).toBe(false);
+    await jest.advanceTimersByTimeAsync(1);
+    await closed;
+    expect(done).toBe(true);
+  });
+});
+
+describe('flush on process exit (beforeExit)', () => {
+  beforeEach(fakeTimers);
+
+  const beforeExit = () => process.emit('beforeExit', 0);
+
+  it('sends queued events at once, without waiting out the backoff', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }, { status: 200 }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(responsesOf(f)).toHaveLength(1);
+
+    beforeExit();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(responsesOf(f)).toHaveLength(2);
+    expect((client as any).queue.size).toBe(0);
+    expect(dropWarnings()).toEqual([]);
+  });
+
+  it('is bounded by exitFlushTimeout; what is left is dropped, logged with its event_id and counted', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': Array(10).fill({ status: 503 }) });
+    const { client } = makeClient({ exitFlushTimeout: 3_000 });
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    const id = responsesOf(f)[0].body.event_id;
+
+    beforeExit();
+    await jest.advanceTimersByTimeAsync(2_999);
+    expect(dropWarnings()).toEqual([]);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(dropWarnings()).toEqual([
+      '[SignalVault] Dropped 1 audit event(s) (process exiting: not delivered within exitFlushTimeout (3000 ms)): ' +
+        `event_id ${id}. Dropped events are not in your audit log. ` +
+        'Call flush() before the process ends to deliver them. Counts by cause: client.droppedEvents.',
+    ]);
+    expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 0, exit: 1 });
+
+    // Nothing is left to keep the process alive or retry.
+    const attempts = responsesOf(f).length;
+    beforeExit();
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(responsesOf(f)).toHaveLength(attempts);
+    expect((client as any).queue.size).toBe(0);
+  });
+
+  it('exitFlushTimeout: 0 disables it', async () => {
+    const f = stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 503 }, { status: 200 }] });
+    const { client } = makeClient({ exitFlushTimeout: 0 });
+    await client.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+
+    beforeExit();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(responsesOf(f)).toHaveLength(1);
+    expect((SignalVaultClient as any).exitClients.has(client)).toBe(false);
+  });
+
+  it('adds one beforeExit listener per process, and holds a client only while it has events queued', async () => {
+    const f = stubFetch({ 'ai.request': [allow, allow, allow], 'ai.response': [{ status: 503 }] });
+    const first = makeClient().client;
+    await first.chat.completions.create({ model: 'm', messages });
+    await jest.advanceTimersByTimeAsync(0);
+    const listeners = process.listenerCount('beforeExit');
+    expect((SignalVaultClient as any).exitClients.has(first)).toBe(true);
+
+    for (let i = 0; i < 2; i++) {
+      const { client } = makeClient();
+      await client.chat.completions.create({ model: 'm', messages });
+      await jest.advanceTimersByTimeAsync(0);
+      expect((SignalVaultClient as any).exitClients.has(client)).toBe(false); // delivered, idle
+    }
+    expect(process.listenerCount('beforeExit')).toBe(listeners);
+
+    await first.flush();
+    expect(responsesOf(f)).toHaveLength(4);
+    expect((SignalVaultClient as any).exitClients.has(first)).toBe(false);
   });
 });
 
