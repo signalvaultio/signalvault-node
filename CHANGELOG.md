@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Requests over the rule-check rate limit are recorded.** Rule checks are limited to 120 requests per minute per app. When SignalVault answers a pre-flight check with 429 and `recorded: true`, it has stored the request, unchecked and with no rules run. With `failMode: 'open'` the SDK sends the request to the provider, warns that guardrails were not applied and that the request is recorded, and then records the response as usual, linked by `request_id`; the background `preflight_unavailable` copy of the request is not sent, because the request is already stored. With `failMode: 'closed'` the SDK throws `SignalVaultUnavailableError` (status 429), as before. A 429 without `recorded: true`, such as the trial limit, is handled as before: no audit events are sent for that request.
+- **The pre-flight check carries `payload.fail_mode`** (`'open'` or `'closed'`), so SignalVault records whether a request it could not check was sent to the provider. Mirror-mode requests, which never wait for a decision, and the background `preflight_unavailable` copy do not carry it.
+- **Audit events are queued and retried.** Responses, tool calls, mirror-mode events and the `preflight_unavailable` copy of a request go through a bounded in-memory queue. A send that fails with a connection error, a timeout, a 5xx or a 429 is retried, up to 6 attempts over about two minutes, with exponential backoff (4, 8, 16, 32 and 60 seconds, less up to 25% jitter) or the server's `Retry-After`, capped at 60 seconds. Other 4xx responses are not retried. Each event keeps its `event_id` across retries, so it is stored once; the `preflight_unavailable` copy has no `event_id` and is de-duplicated by `request_id`, as before. Up to 16 events are sent at a time. The retry timer is unref'd, so the queue never keeps the process alive.
+- **Dropped events are reported.** Up to 1,000 events wait to be sent; beyond that the oldest waiting event is dropped. An event is also dropped after its last attempt, and by `close()` at its deadline. Each case prints a warning with the number of events lost (at most once a minute per cause). A response whose request was dropped is not sent, and is counted with it. The previous warning "Rate limited (429): audit events are being dropped" is gone: a rate-limited event is retried.
+
+### Changes
+
+- **Timeouts are retried.** The `event_id` makes a retry after a timeout safe. `timeout` applies to each attempt.
+- **`tools.record()` resolves after the first attempt.** If that attempt failed and can be retried, the event stays queued and is retried in the background. It was not retried before.
+- **`flush()` sends waiting retries at once** instead of waiting out their backoff. Events still undelivered at its deadline stay queued and keep being retried while the process runs; the warning says how many.
+- **`close()` drops what is still undelivered after flushing,** with a warning, and stops retrying it. Before, it was the same as `flush()`. The client can still be used afterwards.
+- README: what happens over the rule-check limit, how audit events are delivered, and calling `flush()` at the end of every serverless invocation.
+
 ## 0.5.2 — 2026-10-18
 
 Token counts for Anthropic prompt caching.
