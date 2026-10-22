@@ -94,9 +94,13 @@ const server = createServer((req, res) => {
     }
 
     if (req.url === '/anthropic/v1/messages') {
-      // The client authenticates with x-api-key; a Bearer token here would mean
-      // a credential from the developer's shell (ANTHROPIC_AUTH_TOKEN) leaked in.
-      if (req.headers.authorization) return json(400, { error: 'unexpected Authorization header' });
+      // The client's key arrives as x-api-key (@anthropic-ai/sdk 0.x) or as a
+      // Bearer token (1.x), never both. Any other Bearer token would mean a
+      // credential from the developer's shell (ANTHROPIC_AUTH_TOKEN) leaked in.
+      const auth = req.headers.authorization;
+      if (auth && (req.headers['x-api-key'] || auth !== 'Bearer sk-fake')) {
+        return json(400, { error: 'unexpected Authorization header' });
+      }
       const message = { id: 'm1', type: 'message', role: 'assistant', model: body.model, stop_sequence: null };
       if (!body.stream) {
         return json(200, {
