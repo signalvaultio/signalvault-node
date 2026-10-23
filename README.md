@@ -200,7 +200,7 @@ The pre-flight guardrail check is in your request's critical path. If it cannot 
 - `'open'`: the request goes to the provider, the SDK warns that guardrails were not applied, and the response is recorded as usual, linked to the request. Tool calls are recorded as usual too.
 - `'closed'`: the SDK throws `SignalVaultUnavailableError` with `status` 429, and the provider is never called.
 
-The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Audit events — responses, tool calls, mirror-mode events — have a separate limit of 3,000 events per minute per app, and are retried when they reach it (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
+The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Audit events — responses, tool calls, mirror-mode events — do not use rule checks. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
 
 ```typescript
 const client = new SignalVaultClient({
