@@ -188,7 +188,7 @@ const response = await client.chat.completions.create(
 
 ## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, or an invalid response — `failMode` decides what happens:
+The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), a request SignalVault records unchecked (429, below), server error, or an invalid response — `failMode` decides what happens:
 
 - `'open'` (default): the request goes to the provider **without** guardrails, and the SDK prints a warning (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
 - `'closed'`: the SDK throws `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
@@ -200,7 +200,20 @@ The pre-flight guardrail check is in your request's critical path. If it cannot 
 - `'open'`: the request goes to the provider, the SDK warns that guardrails were not applied, and the response is recorded as usual, linked to the request. Tool calls are recorded as usual too.
 - `'closed'`: the SDK throws `SignalVaultUnavailableError` with `status` 429, and the provider is never called.
 
-The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Audit events — responses, tool calls, mirror-mode events — do not use rule checks. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
+The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Responses and tool calls do not use rule checks; mirror-mode requests do. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
+
+**Content the rules cannot read, and scans that do not finish.** When a rule that reads content is on (`contains_pii`, `contains_secret`, `keyword_blocklist`, `regex_match` or `prompt_injection`) and none of them has the action `block`, SignalVault records two more kinds of request unchecked and answers the same 429 with `recorded: true`, without `Retry-After`:
+
+- a request carrying content the rules cannot read — an image, audio, a file, a PDF or a content type they do not know — with the reason `unscanned_content` (SignalVault 0.18.9 and later). The audit event names each content type;
+- a request whose rule scan did not finish in time or stopped before the end of the text, with the reason `scan_timeout`.
+
+`failMode` applies as above, and the warning, or the message of `SignalVaultUnavailableError`, gives the reason:
+
+```
+[SignalVault] The request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content). Guardrails were NOT applied — it is being sent to the provider (failMode: 'open').
+```
+
+Under a `block` rule that reads content, such a request is blocked instead (see [Error Handling](#error-handling)).
 
 ```typescript
 const client = new SignalVaultClient({
@@ -216,7 +229,7 @@ const client = new SignalVaultClient({
 
 Audit events (responses, tool calls, mirror-mode events, and the background record of a request whose check failed, described above) are sent in the background through an in-memory queue, so they never delay your call.
 
-- **Retries.** A send that fails with a connection error, a timeout, a 5xx or a 429 is retried, up to 6 attempts over about two minutes. The wait doubles each time: 4, 8, 16, 32 and 60 seconds, each shortened by up to a quarter at random so that clients do not retry in step. When SignalVault sends `Retry-After`, the SDK waits that long instead, up to 60 seconds. Other 4xx responses are not retried.
+- **Retries.** A send that fails with a connection error, a timeout, a 5xx or a 429 is retried, up to 6 attempts over about two minutes. The wait doubles each time: 4, 8, 16, 32 and 60 seconds, each shortened by up to a quarter at random so that clients do not retry in step. When SignalVault sends `Retry-After`, the SDK waits that long instead, up to 60 seconds. Other 4xx responses are not retried, and neither is a 429 with `recorded: true`: SignalVault has stored the request, unchecked, and would answer a retry the same way, so it counts as delivered and its response is sent.
 - **No double counting.** Each event carries an `event_id` that stays the same across retries, so SignalVault stores it once. The fallback request is de-duplicated by its `request_id`.
 - **Order.** A response is sent after its request has been stored. If the request is dropped, its response is not sent.
 - **Dropping is the last resort.** Up to 1,000 events can wait to be sent. Beyond that the oldest waiting event is dropped. An event is also dropped after its last attempt, and when the process exits before the exit flush (below) could deliver it. A dropped event is not in your audit log.
@@ -347,6 +360,8 @@ When a guardrail rule blocks a request, `create()` throws `SignalVaultBlockedErr
 - `dashboardUrl` — a link to the blocked request, when the API provides one
 
 The message lists only the violation types, never the matched content.
+
+A request carrying content the rules cannot read, under a `block` rule that reads content, is blocked with a violation of type `unscanned_content_guard`; its `details` hold a `description` and `content_types`, naming each type (SignalVault 0.18.9 and later). One whose rule scan did not finish is blocked with `scan_timeout_guard`.
 
 `SignalVaultUnavailableError` (with `requestId` and the HTTP `status`, if any) is thrown only with `failMode: 'closed'`, when no decision could be obtained.
 

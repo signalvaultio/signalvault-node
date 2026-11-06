@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **The warning for a request SignalVault records unchecked gives the reason.** SignalVault answers a pre-flight check with 429 and `recorded: true` when it stores the request without a decision: over the rule-check rate limit (`reason: "pre_flight_rate_limited"`), when a rule's scan does not finish in time or stops before the end of the text (`scan_timeout`, SignalVault 0.18.3 and later), and when the request carries content the rules cannot read — an image, audio, a file, a PDF or a content type they do not know (`unscanned_content`, SignalVault 0.18.9 and later). The SDK read all three as the rate limit. The `failMode: 'open'` warning and the `SignalVaultUnavailableError` message now name the reason, for example: "The request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content). Guardrails were NOT applied — it is being sent to the provider (failMode: 'open')." Each reason is warned about at most once a minute, separately from the rate limit, whose wording is unchanged. A reason this version does not know is named rather than read as the rate limit. The fail modes, `status` 429 and the response event are unchanged.
+- **A background `ai.request` that SignalVault records unchecked is not retried.** The `ai.request` sent in mirror mode, and the background record of a request whose check failed, were retried on a 429 with `recorded: true` like a rate limit. SignalVault had stored them and answers a retry the same way, so after 6 attempts the request was logged as dropped (`retriesExhausted`) and its response was not sent. Such a 429 now counts as delivered, and the response follows. With SignalVault 0.18.9 this covers every mirror-mode request carrying an image, audio, a file or a PDF while a rule that reads content is on and none of those rules blocks.
+- README: content the rules cannot read and scans that do not finish, the block for them, and that mirror-mode requests use rule checks (responses and tool calls do not).
+
 ## 0.6.0 — 2026-10-22
 
 Audit events are queued and retried, and requests over the rule-check rate limit stay in the audit log.

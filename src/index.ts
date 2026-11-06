@@ -133,7 +133,8 @@ function describeError(error: unknown, secret: string): string {
 
 /**
  * What to do when SignalVault cannot return a guardrail decision (unreachable,
- * timed out, rate limited, invalid key, inactive subscription, ...).
+ * timed out, rate limited, invalid key, inactive subscription, content its
+ * rules cannot read, ...).
  *
  * - `'open'` (default): allow the request and print a warning.
  * - `'closed'`: throw {@link SignalVaultUnavailableError} instead of calling
@@ -259,16 +260,44 @@ const ALLOW: SignalVaultDecision = { decision: 'allow', violations: [], redactio
  * Set on the decision returned when no pre-flight decision was obtained.
  * 'record': the server may not have stored the request (network, timeout,
  * 5xx, invalid response), so it is recorded in the background and the
- * unchecked call still appears in the audit log. 'recorded': the server was
- * over the app's rule-check rate limit and stored the request unchecked
- * (429 with `recorded: true`), so the response is sent as usual. 'skip': the
- * server refused it (401/402/403/other 429/3xx), so a response event would be
+ * unchecked call still appears in the audit log. 'recorded': the server
+ * stored the request unchecked (429 with `recorded: true`: over the app's
+ * rule-check rate limit, a rule scan that did not finish, or content the
+ * rules cannot read), so the response is sent as usual. 'skip': the server
+ * refused it (401/402/403/other 429/3xx), so a response event would be
  * refused too.
  */
 const PREFLIGHT_FAILED = Symbol('preflightFailed');
 /** Causes where re-sending the ai.request later can succeed. */
 const RECORDABLE_CAUSES = new Set(['timeout', 'network', '5xx', 'invalid-response']);
 const DECISIONS = new Set(['allow', 'warn', 'block', 'redact']);
+
+/**
+ * Why SignalVault stored a pre-flight unchecked (429 with `recorded: true`),
+ * from the body's `reason`, as [warning key, reason]. Null for the rule-check
+ * rate limit (`pre_flight_rate_limited`, or no reason), which keeps its own
+ * wording. The body names no content types; the audit event does.
+ */
+function uncheckedReason(reason: unknown): [string, string] | null {
+  if (reason === undefined || reason === null || reason === 'pre_flight_rate_limited') return null;
+  if (reason === 'unscanned_content') {
+    return [
+      '429-unscanned-content',
+      "the request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a " +
+        'content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content)',
+    ];
+  }
+  if (reason === 'scan_timeout') {
+    return [
+      '429-scan-timeout',
+      "a rule's scan of the request did not finish in time or stopped before the end of the text, so " +
+        'SignalVault recorded it unchecked (429: scan_timeout)',
+    ];
+  }
+  // A reason this version does not know: named when it looks like a code.
+  const code = typeof reason === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? `429: ${reason}` : '429';
+  return ['429-unchecked', `SignalVault recorded the request unchecked (${code})`];
+}
 
 /**
  * How a dropped or undelivered event is named in a warning. The fallback
@@ -1117,23 +1146,26 @@ export class SignalVaultClient {
   /**
    * Called when no decision could be obtained. Throws in failMode 'closed';
    * otherwise warns (never silently) and allows. `recorded`: the server
-   * stored the request without checking it.
+   * stored the request without checking it. `warning`: the fail-open warning,
+   * when the default does not fit.
    */
   private unavailable(
     requestId: string,
     key: string,
     reason: string,
     status?: number,
-    recorded = false
+    recorded = false,
+    warning?: string
   ): SignalVaultDecision {
     if (this.failMode === 'closed') {
       throw new SignalVaultUnavailableError(requestId, reason, status);
     }
     this.warn(
       `preflight:${key}`,
-      `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent ` +
-        `to the provider unchecked (failMode: 'open').` +
-        (recorded ? ' They are still recorded in the audit log, marked as unchecked.' : '')
+      warning ??
+        `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent ` +
+          `to the provider unchecked (failMode: 'open').` +
+          (recorded ? ' They are still recorded in the audit log, marked as unchecked.' : '')
     );
     const decision: SignalVaultDecision = { ...ALLOW, violations: [], redactions: [] };
     (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED] = recorded
@@ -1147,8 +1179,8 @@ export class SignalVaultClient {
   /**
    * The ai.request body to record in the background when the pre-flight got
    * no decision, so an unchecked call is still in the audit log. Undefined
-   * when the server stored the pre-flight (with a decision, or unchecked over
-   * the rule-check rate limit); null when the server refused it and no audit
+   * when the server stored the pre-flight (with a decision, or unchecked: 429
+   * with `recorded: true`); null when the server refused it and no audit
    * event should be sent.
    */
   private fallbackRequest(
@@ -1280,8 +1312,18 @@ export class SignalVaultClient {
         body = undefined;
       }
       if (result.status === 429 && body?.recorded === true) {
-        // Over the app's rule-check rate limit: the server stored the
-        // request, with no rules run, but there is still no decision.
+        // The server stored the request unchecked, but there is still no
+        // decision: over the app's rule-check rate limit, or for a reason
+        // that is not a limit and a retry would not change.
+        const unchecked = uncheckedReason(body.reason);
+        if (unchecked) {
+          const [key, reason] = unchecked;
+          return this.unavailable(
+            requestId, key, reason, 429, true,
+            `[SignalVault] ${reason[0].toUpperCase()}${reason.slice(1)}. Guardrails were NOT applied — it is ` +
+              `being sent to the provider (failMode: 'open').`
+          );
+        }
         return this.unavailable(
           requestId, '429-recorded', 'SignalVault rule-check rate limit reached (429)', 429, true
         );
