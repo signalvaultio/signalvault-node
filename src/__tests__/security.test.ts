@@ -368,6 +368,113 @@ describe('pre-flight over the rule-check rate limit (429, recorded)', () => {
     expect(err.status).toBe(429);
     expect(openai.sent).toHaveLength(0);
   });
+
+  it('keeps the rate-limit wording, fail-open and fail-closed', async () => {
+    stubFetch({ 'ai.request': [recorded, recorded] });
+    await makeClient().client.chat.completions.create({ model: 'm', messages });
+    expect(warnSpy.mock.calls.map((c) => c[0])).toEqual([
+      "[SignalVault] SignalVault rule-check rate limit reached (429). Guardrails were NOT applied — requests are " +
+        "being sent to the provider unchecked (failMode: 'open'). They are still recorded in the audit log, " +
+        'marked as unchecked.',
+    ]);
+
+    const closed = makeClient({ failMode: 'closed' }).client;
+    const err = await closed.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err.message).toBe(
+      "[SignalVault] Guardrail check unavailable: SignalVault rule-check rate limit reached (429). Request not " +
+        "sent (failMode: 'closed')."
+    );
+  });
+});
+
+// A request whose rule scan did not finish (server 0.18.3+) or that carries
+// content the rules cannot read (0.18.9+), with no block rule on: the server
+// stores it unchecked and answers 429 with `recorded: true` and that reason,
+// without Retry-After. It is not the rule-check rate limit.
+describe('pre-flight recorded unchecked for its content (429, recorded)', () => {
+  const unchecked = (reason: string) => ({
+    status: 429,
+    body: { error: reason, reason, recorded: true, event_id: 'evt_1', decision: 'unchecked' },
+  });
+  const UNSCANNED =
+    "the request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a content " +
+    'type they do not know), so SignalVault recorded it unchecked (429: unscanned_content)';
+  const SCAN_TIMEOUT =
+    "a rule's scan of the request did not finish in time or stopped before the end of the text, so SignalVault " +
+    'recorded it unchecked (429: scan_timeout)';
+  const capitalized = (s: string) => s[0].toUpperCase() + s.slice(1);
+
+  it.each([
+    ['unscanned_content', UNSCANNED],
+    ['scan_timeout', SCAN_TIMEOUT],
+  ])('%s, fail-open: says why, forwards, and sends the response without a fallback', async (reason, text) => {
+    const f = stubFetch({ 'ai.request': [unchecked(reason)] });
+    const { client, openai } = makeClient();
+    const completion = await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+
+    expect(completion.choices[0].message.content).toBe('hello');
+    expect(openai.sent).toHaveLength(1);
+    expect(warnSpy.mock.calls.map((c) => c[0])).toEqual([
+      `[SignalVault] ${capitalized(text)}. Guardrails were NOT applied — it is being sent to the provider ` +
+        "(failMode: 'open').",
+    ]);
+    expect(f.types()).toEqual(['ai.request', 'ai.response']);
+    expect(f.calls[1].body.request_id).toBe(f.calls[0].body.request_id);
+  });
+
+  it.each([
+    ['unscanned_content', UNSCANNED],
+    ['scan_timeout', SCAN_TIMEOUT],
+  ])('%s, fail-closed: throws with that reason and sends nothing else', async (reason, text) => {
+    const f = stubFetch({ 'ai.request': [unchecked(reason)] });
+    const { client, openai } = makeClient({ failMode: 'closed' });
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    await client.flush();
+
+    expect(err).toBeInstanceOf(SignalVaultUnavailableError);
+    expect(err.status).toBe(429);
+    expect(err.message).toBe(
+      `[SignalVault] Guardrail check unavailable: ${text}. Request not sent (failMode: 'closed').`
+    );
+    expect(openai.sent).toHaveLength(0);
+    expect(f.types()).toEqual(['ai.request']);
+  });
+
+  it('an unknown reason is named, not read as the rate limit', async () => {
+    stubFetch({ 'ai.request': [unchecked('new_reason'), unchecked('<b>not a code</b>')] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    const closed = makeClient({ failMode: 'closed' }).client;
+    const err = await closed.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+
+    expect(warnSpy.mock.calls.map((c) => c[0])).toEqual([
+      '[SignalVault] SignalVault recorded the request unchecked (429: new_reason). Guardrails were NOT applied ' +
+        "— it is being sent to the provider (failMode: 'open').",
+    ]);
+    expect(err.message).toBe(
+      "[SignalVault] Guardrail check unavailable: SignalVault recorded the request unchecked (429). Request not " +
+        "sent (failMode: 'closed')."
+    );
+  });
+
+  it('warns once a minute per reason, apart from the rate limit', async () => {
+    const rateLimited = {
+      status: 429,
+      headers: { 'retry-after': '60' },
+      body: { error: 'rate_limited', reason: 'pre_flight_rate_limited', recorded: true, decision: 'unchecked' },
+    };
+    stubFetch({
+      'ai.request': [rateLimited, unchecked('unscanned_content'), unchecked('unscanned_content'), unchecked('scan_timeout')],
+    });
+    const { client } = makeClient();
+    for (let i = 0; i < 4; i++) await client.chat.completions.create({ model: 'm', messages });
+    expect(warnSpy.mock.calls.map((c) => c[0])).toEqual([
+      expect.stringMatching(/rule-check rate limit/),
+      expect.stringMatching(/unscanned_content/),
+      expect.stringMatching(/scan_timeout/),
+    ]);
+  });
 });
 
 describe('decisions', () => {
@@ -383,6 +490,22 @@ describe('decisions', () => {
     expect(err.message).toBe('[SignalVault] Request blocked by guardrails (contains_secret).');
     expect(err.violations).toEqual(violations);
     expect(err.dashboardUrl).toBe('https://signalvault.io/x');
+    expect(openai.sent).toHaveLength(0);
+  });
+
+  // Under a block rule, content the rules cannot read is a block (server 0.18.9+).
+  it('a block for unscanned content names its type and carries the content types', async () => {
+    const violations = [{
+      rule_id: 'system', type: 'unscanned_content_guard', severity: 10, action: 'block',
+      details: { reason: 'unscanned_content', description: '...', content_types: ['image_url'] },
+    }];
+    stubFetch({ 'ai.request': [{ status: 200, body: { decision: 'block', violations, redactions: [] } }] });
+    const { client, openai } = makeClient();
+
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultBlockedError);
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (unscanned_content_guard).');
+    expect(err.violations[0].details.content_types).toEqual(['image_url']);
     expect(openai.sent).toHaveLength(0);
   });
 
@@ -870,6 +993,44 @@ describe('background retry policy', () => {
         `event_id ${f.calls[0].body.event_id} and its ai.response, not sent\\.`)
     );
     expect(client.droppedEvents.retriesExhausted).toBe(2);
+  });
+
+  // The server stored the ai.request unchecked, and answers a replay the same
+  // way, so a retry can never succeed.
+  describe.each([
+    ['unscanned_content', {}],
+    ['scan_timeout', {}],
+    ['pre_flight_rate_limited', { 'retry-after': '60' }],
+  ])('a background ai.request answered 429 recorded: true (%s)', (reason, headers) => {
+    const recordedReply = {
+      status: 429,
+      headers,
+      body: { error: reason, reason, recorded: true, event_id: 'evt_1', decision: 'unchecked' },
+    };
+
+    it('mirror mode: is not retried or dropped, and its response is sent', async () => {
+      const f = stubFetch({ 'ai.request': Array(10).fill(recordedReply) });
+      const { client } = makeClient({ mirrorMode: true });
+      await client.chat.completions.create({ model: 'm', messages });
+      await jest.advanceTimersByTimeAsync(300_000);
+
+      expect(f.types()).toEqual(['ai.request', 'ai.response']);
+      expect(f.calls[1].body.request_id).toBe(f.calls[0].body.request_id);
+      expect(dropWarnings()).toEqual([]);
+      expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 0, exit: 0 });
+    });
+
+    it('fallback after a 503: is not retried or dropped, and the response follows', async () => {
+      const f = stubFetch({ 'ai.request': [{ status: 503 }, ...Array(10).fill(recordedReply)] });
+      const { client } = makeClient();
+      await client.chat.completions.create({ model: 'm', messages });
+      await jest.advanceTimersByTimeAsync(300_000);
+
+      expect(f.types()).toEqual(['ai.request', 'ai.request', 'ai.response']);
+      expect(f.calls[1].body.payload.preflight_unavailable).toBe(true);
+      expect(dropWarnings()).toEqual([]);
+      expect(client.droppedEvents).toEqual({ queueFull: 0, retriesExhausted: 0, exit: 0 });
+    });
   });
 
   it('logs a dropped fallback ai.request by its request_id, which it has instead of an event_id', async () => {

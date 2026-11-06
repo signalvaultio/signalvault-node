@@ -23,7 +23,8 @@ export interface PostResult {
 }
 
 /**
- * - `delivered`: the server accepted the event (2xx).
+ * - `delivered`: the server accepted the event (2xx), or stored an ai.request
+ *   unchecked (a 429 with `recorded: true`, see `recordedUnchecked`).
  * - `rejected`: the server refused it (3xx, or 4xx other than 429); not retried.
  * - `retrying`: only from `firstAttempt`: it failed and is queued for a retry.
  * - `dropped`: lost: the queue overflowed, the attempts ran out, or the
@@ -92,11 +93,12 @@ export function parseRetryAfterMs(response?: Response): number | null {
 
 /**
  * Bounded in-memory queue for audit events. Each event is retried on network
- * errors, timeouts, 5xx and 429, with exponential backoff or the server's
- * Retry-After, for up to MAX_ATTEMPTS attempts. Retrying is safe because the
- * caller gives each event an idempotency key (`event_id`, or `request_id` for
- * the fallback ai.request). Its one timer is unref'd, so a waiting retry never
- * keeps the process alive; flush() is how a caller waits for it.
+ * errors, timeouts, 5xx and 429 (not a 429 with `recorded: true`), with
+ * exponential backoff or the server's Retry-After, for up to MAX_ATTEMPTS
+ * attempts. Retrying is safe because the caller gives each event an
+ * idempotency key (`event_id`, or `request_id` for the fallback ai.request).
+ * Its one timer is unref'd, so a waiting retry never keeps the process alive;
+ * flush() is how a caller waits for it.
  */
 export class EventQueue {
   /** Events not in flight, oldest first. */
@@ -223,7 +225,7 @@ export class EventQueue {
     try {
       const result = await this.hooks.send(entry.body);
       entry.lastStatus = result.status;
-      ok = result.ok;
+      ok = result.ok || (result.status === 429 && (await recordedUnchecked(result.response)));
       if (!ok && (result.status === 429 || result.status >= 500)) {
         retryable = true;
         retryAfterMs = parseRetryAfterMs(result.response);
@@ -283,6 +285,21 @@ export class EventQueue {
 
 function toDropped(entry: Entry): DroppedEntry {
   return { body: entry.body, lost: entry.lost, lastStatus: entry.lastStatus };
+}
+
+/**
+ * Whether a 429 says `recorded: true`: the server stored the ai.request
+ * without checking it (over the rule-check rate limit, a rule scan that did
+ * not finish, content the rules cannot read) and answers a replay the same
+ * way, so the event is delivered and a retry could never succeed.
+ */
+async function recordedUnchecked(response?: Response): Promise<boolean> {
+  try {
+    const body = (await response?.json()) as { recorded?: unknown } | null | undefined;
+    return body?.recorded === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
