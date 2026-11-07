@@ -232,7 +232,8 @@ describe('pre-flight failures', () => {
   });
 
   it('warns at most once per minute for the same failure', async () => {
-    stubFetch({ 'ai.request': [{ status: 401 }, { status: 401 }, { status: 401 }] });
+    // Each pre-flight, then the fallback ai.request, which the key is refused for too.
+    stubFetch({ 'ai.request': Array(6).fill({ status: 401 }) });
     const { client } = makeClient();
     for (let i = 0; i < 3; i++) await client.chat.completions.create({ model: 'm', messages });
     expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -286,7 +287,9 @@ describe('fail_mode on the pre-flight', () => {
     const fallback = stubFetch({ 'ai.request': [{ status: 503 }] });
     await makeClient().client.chat.completions.create({ model: 'm', messages });
     await new Promise((resolve) => setImmediate(resolve));
-    expect(fallback.calls[1].body.payload).toEqual({ messages, preflight_unavailable: true, fail_mode: 'open' });
+    expect(fallback.calls[1].body.payload).toEqual({
+      messages, preflight_unavailable: true, fail_mode: 'open', preflight_status: 503, preflight_reason: 'http_503',
+    });
   });
 });
 
@@ -344,11 +347,11 @@ describe('pre-flight over the rule-check rate limit (429, recorded)', () => {
   });
 
   it.each([
-    ['no recorded field', { error: 'rate_limited' }, /rate limit reached/],
-    ['recorded: false', { error: 'rate_limited', recorded: false }, /rate limit reached/],
-    ['recorded as a string', { error: 'rate_limited', recorded: 'true' }, /rate limit reached/],
-    ['trial limit', { error: { type: 'trial_limit_exceeded' } }, /trial limit/],
-  ])('a 429 with %s is handled as before: forwarded, no audit events', async (_label, body, pattern) => {
+    ['no recorded field', { error: 'rate_limited' }, /rate limit reached/, 'rate_limited'],
+    ['recorded: false', { error: 'rate_limited', recorded: false }, /rate limit reached/, 'rate_limited'],
+    ['recorded as a string', { error: 'rate_limited', recorded: 'true' }, /rate limit reached/, 'rate_limited'],
+    ['trial limit', { error: { type: 'trial_limit_exceeded' } }, /trial limit/, 'trial_limit_exceeded'],
+  ])('a 429 with %s: forwarded, and the SDK records the request before the response', async (_label, body, pattern, reason) => {
     const f = stubFetch({ 'ai.request': [{ status: 429, headers: { 'retry-after': '60' }, body }] });
     const { client, openai } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
@@ -357,7 +360,10 @@ describe('pre-flight over the rule-check rate limit (429, recorded)', () => {
     expect(openai.sent).toHaveLength(1);
     expect(warnSpy.mock.calls[0][0]).toMatch(pattern);
     expect(warnSpy.mock.calls[0][0]).not.toMatch(/still recorded/);
-    expect(f.types()).toEqual(['ai.request']);
+    expect(f.types()).toEqual(['ai.request', 'ai.request', 'ai.response']);
+    expect(f.calls[1].body.payload).toEqual({
+      messages, preflight_unavailable: true, fail_mode: 'open', preflight_status: 429, preflight_reason: reason,
+    });
   });
 
   it('a plain 429 still throws in fail-closed', async () => {
@@ -810,15 +816,19 @@ describe('audit when the pre-flight got no decision', () => {
     const fallback = f.calls[1].body;
     expect(fallback.request_id).toBe(f.calls[0].body.request_id);
     expect(fallback.event_id).toBeUndefined();
-    expect(fallback.payload).toEqual({ messages, preflight_unavailable: true, fail_mode: 'open' });
+    expect(fallback.payload).toEqual({
+      messages, preflight_unavailable: true, fail_mode: 'open', preflight_status: 503, preflight_reason: 'http_503',
+    });
   });
 
-  it('sends no audit events after the server refused the pre-flight (401)', async () => {
-    const f = stubFetch({ 'ai.request': [{ status: 401 }] });
+  // SignalVault refuses every event from a key it refuses, the record included.
+  it('sends the record after the server refused the key (401); a refused record is not retried', async () => {
+    const f = stubFetch({ 'ai.request': [{ status: 401 }, { status: 401 }], 'ai.response': [{ status: 401 }] });
     const { client } = makeClient();
     await client.chat.completions.create({ model: 'm', messages });
     await client.flush();
-    expect(f.types()).toEqual(['ai.request']);
+    expect(f.types()).toEqual(['ai.request', 'ai.request', 'ai.response']);
+    expect(f.calls[1].body.payload).toMatchObject({ preflight_status: 401, preflight_reason: 'http_401' });
   });
 });
 
