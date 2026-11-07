@@ -556,7 +556,8 @@ function withStreamUsage(
  * ```
  */
 export class SignalVaultClient {
-  private readonly svApiKey: string;
+  /** ES-private, so util.inspect, console.log and JSON.stringify never show it. */
+  readonly #svApiKey: string;
   private readonly svBaseUrl: string;
   private readonly svEnvironment: string;
   private readonly debugMode: boolean;
@@ -592,7 +593,7 @@ export class SignalVaultClient {
       throw new Error("[SignalVault] failMode must be 'open' or 'closed'.");
     }
 
-    this.svApiKey = normalizeApiKey(config.apiKey);
+    this.#svApiKey = normalizeApiKey(config.apiKey);
     this.svBaseUrl = normalizeBaseUrl(config.baseUrl || DEFAULT_BASE_URL);
     this.svEnvironment = config.environment || 'production';
     this.debugMode = config.debug || false;
@@ -607,12 +608,26 @@ export class SignalVaultClient {
       dropped: (reason, entries) => this.reportDropped(reason, entries),
       busy: (busy) => this.onQueueBusy(busy),
       debug: (message, detail) => {
-        if (this.debugMode) console.error(`[SignalVault] ${message}`, describeError(detail, this.svApiKey));
+        if (this.debugMode) console.error(`[SignalVault] ${message}`, describeError(detail, this.#svApiKey));
       },
     });
 
     this.openai = config.openaiApiKey ? loadOpenAI(config.openaiApiKey) : null;
     this.anthropic = config.anthropicApiKey ? loadAnthropic(config.anthropicApiKey) : null;
+  }
+
+  /**
+   * What util.inspect and console.log print: the client without the provider
+   * clients, which hold the provider API keys. The SignalVault key is not a
+   * property at all (#svApiKey).
+   */
+  [Symbol.for('nodejs.util.inspect.custom')](
+    depth: number,
+    options: object,
+    inspect: (value: unknown, options: object) => string
+  ): string {
+    const { openai: _openai, anthropic: _anthropic, ...rest } = this as unknown as Record<string, unknown>;
+    return `SignalVaultClient ${inspect(rest, { ...options, depth })}`;
   }
 
   // ---------------------------------------------------------------------------
@@ -753,7 +768,7 @@ export class SignalVaultClient {
     const tracked = promise
       .catch((err) => {
         if (this.debugMode) {
-          console.error('[SignalVault] Background event failed:', describeError(err, this.svApiKey));
+          console.error('[SignalVault] Background event failed:', describeError(err, this.#svApiKey));
         }
       })
       .finally(() => this.pending.delete(tracked));
@@ -1355,7 +1370,7 @@ export class SignalVaultClient {
     return {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      Authorization: `Bearer ${this.svApiKey}`,
+      Authorization: `Bearer ${this.#svApiKey}`,
       'User-Agent': `signalvault-node/${SDK_VERSION} node/${process.versions.node}`,
     };
   }
@@ -1396,7 +1411,7 @@ export class SignalVaultClient {
     } catch (error) {
       // A circular or BigInt value in the messages, the metadata or the model.
       if (this.debugMode) {
-        console.error('[SignalVault] Pre-flight not sent:', describeError(error, this.svApiKey));
+        console.error('[SignalVault] Pre-flight not sent:', describeError(error, this.#svApiKey));
       }
       return this.unavailable(
         requestId, 'unserializable', 'SignalVault could not serialize the request to JSON for the pre-flight check',
@@ -1410,7 +1425,7 @@ export class SignalVaultClient {
     } catch (error) {
       const timedOut = isTimeout(error);
       if (this.debugMode) {
-        console.error('[SignalVault] Pre-flight failed:', describeError(error, this.svApiKey));
+        console.error('[SignalVault] Pre-flight failed:', describeError(error, this.#svApiKey));
       }
       return this.unavailable(
         requestId,

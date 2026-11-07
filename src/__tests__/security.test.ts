@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as util from 'util';
 import {
   SDK_VERSION,
   SignalVaultBlockedError,
@@ -187,6 +188,53 @@ describe('apiKey', () => {
     expect(logged).toContain('Pre-flight failed: TypeError: fetch failed <- Error: bad header "Bearer [redacted]"');
     expect(logged).toContain('Event send failed: TypeError: fetch failed <- Error: bad header "Bearer [redacted]"');
     expect(logged).not.toContain('sk_test_abc');
+  });
+});
+
+describe('inspecting the client', () => {
+  const SV_KEY = 'sk_test_SVSECRET0123';
+  const OPENAI_KEY = 'sk-OPENAISECRET0123';
+  const ANTHROPIC_KEY = 'sk-ant-ANTHROPICSECRET0123';
+
+  /** A client with a real openai client, and an Anthropic client holding its key the same way. */
+  function keyedClient() {
+    const client = new SignalVaultClient({ apiKey: SV_KEY, openaiApiKey: OPENAI_KEY, baseUrl: 'https://sv.example' });
+    // @anthropic-ai/sdk is not a dev dependency.
+    (client as any).anthropic = { apiKey: ANTHROPIC_KEY, messages: { create: async () => ({}) } };
+    clients.push(client);
+    return client;
+  }
+
+  it.each([
+    ['util.inspect', (c: unknown) => util.inspect(c)],
+    ['util.inspect, every level, hidden properties', (c: unknown) => util.inspect(c, { depth: Infinity, showHidden: true })],
+    ['util.format, as console.log prints it', (c: unknown) => util.format(c)],
+    ["util.format('%o')", (c: unknown) => util.format('%o', c)],
+  ])('%s shows neither the SignalVault key nor a provider key', (_label, print) => {
+    const out = print(keyedClient());
+    expect(out).toMatch(/^SignalVaultClient /);
+    expect(out).toContain('https://sv.example');
+    for (const key of [SV_KEY, OPENAI_KEY, ANTHROPIC_KEY]) expect(out).not.toContain(key);
+  });
+
+  it('JSON.stringify still throws on the provider client, without the keys in the error', () => {
+    const client = keyedClient();
+    let message = '';
+    try {
+      JSON.stringify(client);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/circular structure/);
+    for (const key of [SV_KEY, OPENAI_KEY, ANTHROPIC_KEY]) expect(message).not.toContain(key);
+  });
+
+  it('the key is still sent', async () => {
+    const f = stubFetch({ 'ai.request': [allow] });
+    const client = keyedClient();
+    (client as any).openai = openaiStub().client;
+    await client.chat.completions.create({ model: 'm', messages });
+    expect((f.calls[0].init.headers as Record<string, string>).Authorization).toBe(`Bearer ${SV_KEY}`);
   });
 });
 
