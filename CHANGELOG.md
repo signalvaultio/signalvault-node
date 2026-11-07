@@ -4,6 +4,10 @@
 
 A refusal from SignalVault stops the request in both fail modes, and with `failMode: 'open'` the SDK sends its own record of every request SignalVault did not store, before the provider call.
 
+### Security
+
+- **`util.inspect(client)` and `console.log(client)` show no API keys.** The SignalVault key is kept in an ES private field, and the client prints without its `openai` and `anthropic` provider clients, which hold the provider keys. `JSON.stringify(client)` behaves as before.
+
 ### Changes
 
 - **A refusal from SignalVault throws `SignalVaultBlockedError` in both fail modes.** A pre-flight answer whose body says `content_policy_violation` (as `error`, `error.code` or `error.type`), at any status, or a non-2xx answer with `decision: "block"`, is handled as a block: the provider is not called, and the error carries the violations and dashboard URL from the body when present. Such an answer was handled as a failed check: with `failMode: 'open'` the request went to the provider, and with `'closed'` the SDK threw `SignalVaultUnavailableError`. SignalVault's events API answers a block with a 200 decision; `content_policy_violation` is the block answer of SignalVault's proxy, matched defensively.
