@@ -9,6 +9,7 @@ import {
   SignalVaultUnavailableError,
   normalizeBaseUrl,
 } from '../index';
+import { resetRefusalWarnings } from '../refused';
 
 type Reply = { status: number; body?: unknown; headers?: Record<string, string> };
 
@@ -82,6 +83,7 @@ const responsesOf = (f: ReturnType<typeof stubFetch>) => f.calls.filter((c) => c
 let warnSpy: jest.SpyInstance;
 beforeEach(() => {
   warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  resetRefusalWarnings();
 });
 afterEach(async () => {
   for (const client of clients.splice(0)) (client as any).queue.abandon('exit');
@@ -284,7 +286,12 @@ describe('pre-flight failures', () => {
     stubFetch({ 'ai.request': Array(6).fill({ status: 401 }) });
     const { client } = makeClient();
     for (let i = 0; i < 3; i++) await client.chat.completions.create({ model: 'm', messages });
-    expect(warnSpy).toHaveBeenCalledTimes(1);
+    await client.flush();
+    // The pre-flight warning, then the refused fallback records' own warning, once.
+    expect(warnSpy.mock.calls.map((c) => c[0])).toEqual([
+      expect.stringMatching(/rejected the API key \(401: invalid or revoked\)\. Guardrails were NOT applied/),
+      expect.stringMatching(/refused an audit event \(401\)/),
+    ]);
   });
 
   it('fail-closed throws and never calls the provider', async () => {
@@ -1136,6 +1143,120 @@ describe('background retry policy', () => {
     await jest.advanceTimersByTimeAsync(4_000);
     expect(f.types()).toEqual(['agent.tool_call', 'agent.tool_call']);
     expect(f.calls[0].body.event_id).toBe(f.calls[1].body.event_id);
+  });
+});
+
+describe('background events refused for the key or the account (401, 402, 403)', () => {
+  const refused = (status: number): string => {
+    const fix: Record<number, string> = {
+      401: 'Check the API key at signalvault.io.',
+      402: 'Check the account at signalvault.io.',
+      403: "Check the key's environment and account at signalvault.io.",
+    };
+    return `[SignalVault] SignalVault refused an audit event (${status}): requests are not being recorded. ${fix[status]}`;
+  };
+  const refusedWarnings = (): string[] =>
+    warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => /refused an audit event/.test(m));
+
+  it.each([401, 402, 403])(
+    'a %i warns once per process, without debug, across two clients and several refused events',
+    async (status) => {
+      const no = { status, body: {} };
+      const f = stubFetch({
+        // a: the pre-flight (no decision), then a's fallback record; b (mirror mode): its request.
+        'ai.request': [{ status: 503 }, no, no],
+        'ai.response': [no, no],
+        'agent.tool_call': [no, no, no],
+      });
+      const { client: a } = makeClient();
+      const { client: b } = makeClient({ mirrorMode: true });
+
+      await a.chat.completions.create({ model: 'm', messages });
+      await a.tools.record({ toolName: 'lookup', durationMs: 1 });
+      await a.tools.record({ toolName: 'lookup', durationMs: 1 });
+      await a.flush();
+      await b.chat.completions.create({ model: 'm', messages });
+      await b.tools.record({ toolName: 'lookup', durationMs: 1 });
+      await b.flush();
+
+      // Every background event was sent once and refused; none is retried.
+      expect(f.types().sort()).toEqual([
+        'agent.tool_call', 'agent.tool_call', 'agent.tool_call',
+        'ai.request', 'ai.request', 'ai.request', 'ai.response', 'ai.response',
+      ]);
+      expect(refusedWarnings()).toEqual([refused(status)]);
+      // The tool call's own per-call warning gives way to this one.
+      expect(warnSpy.mock.calls.filter((c) => /tool_call rejected/.test(c[0]))).toEqual([]);
+    }
+  );
+
+  it('warns once for each of 401, 402 and 403', async () => {
+    stubFetch({
+      'agent.tool_call': [401, 402, 403, 401, 402, 403].map((status) => ({ status })),
+    });
+    const { client } = makeClient();
+    for (let i = 0; i < 6; i++) await client.tools.record({ toolName: 'lookup', durationMs: 1 });
+    await client.flush();
+    expect(refusedWarnings()).toEqual([refused(401), refused(402), refused(403)]);
+  });
+
+  it.each([
+    ['the fallback record', { 'ai.request': [{ status: 503 }, { status: 401 }] }, {}],
+    ['a response', { 'ai.request': [allow], 'ai.response': [{ status: 401 }] }, {}],
+    ['a tool call', { 'agent.tool_call': [{ status: 401 }] }, {}],
+    ['a mirror-mode request', { 'ai.request': [{ status: 401 }] }, { mirrorMode: true }],
+  ])('warns for %s', async (_event, replies: Record<string, Reply[]>, config: Partial<SignalVaultConfig>) => {
+    stubFetch(replies);
+    const { client } = makeClient(config);
+    if (replies['agent.tool_call']) await client.tools.record({ toolName: 'lookup', durationMs: 1 });
+    else await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(refusedWarnings()).toEqual([refused(401)]);
+  });
+
+  it.each([
+    [402, { error: 'subscription_inactive', message: 'Subscription inactive.' }, 'subscription_inactive'],
+    [402, { error: { code: 'app_paused' } }, 'app_paused'],
+    [403, { error: 'environment_not_allowed', message: 'Environment not allowed for your plan.' }, 'environment_not_allowed'],
+  ])('names the code of a %i', async (status, body, code) => {
+    stubFetch({ 'ai.request': [allow], 'ai.response': [{ status, body }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(refusedWarnings()).toEqual([refused(status).replace(`(${status})`, `(${status}: ${code})`)]);
+  });
+
+  it('keeps text from the server out of the warning', async () => {
+    const forged = 'Invalid key\n[SignalVault] All rules passed';
+    stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 401, body: { error: forged, message: forged } }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(refusedWarnings()).toEqual([refused(401)]);
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('All rules passed');
+  });
+
+  it('with debug, warns the same and keeps the debug detail', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    stubFetch({ 'ai.request': [allow], 'ai.response': [{ status: 403 }] });
+    const { client } = makeClient({ debug: true });
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(refusedWarnings()).toEqual([refused(403)]);
+    expect(errorSpy).toHaveBeenCalledWith('[SignalVault] Event not delivered:', '403');
+  });
+
+  it.each([400, 422])('a %i refusal keeps its behaviour: no new warning', async (status) => {
+    stubFetch({ 'ai.request': [allow], 'ai.response': [{ status }], 'agent.tool_call': [{ status }] });
+    const { client } = makeClient();
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.tools.record({ toolName: 'lookup', durationMs: 1 });
+    await client.flush();
+    // The response is logged only with debug; the tool call warns, as before.
+    expect(warnSpy.mock.calls).toEqual([
+      [`[SignalVault] tool_call rejected with ${status}. Check your apiKey and event payload.`],
+    ]);
   });
 });
 
