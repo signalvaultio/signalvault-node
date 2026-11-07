@@ -72,7 +72,7 @@ console.log(response.content[0].text);
 
 ## Streaming
 
-Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early or the stream fails. A stream you never iterate is not logged.
+Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early or the stream fails. A stream you never iterate has no response in the log (in mirror mode, no request either).
 
 ```typescript
 // OpenAI streaming
@@ -188,19 +188,22 @@ const response = await client.chat.completions.create(
 
 ## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), a request SignalVault records unchecked (429, below), server error, or an invalid response — `failMode` decides what happens:
+The pre-flight guardrail check is in your request's critical path. What the SDK does with its answer:
 
-- `'open'` (default): the request goes to the provider **without** guardrails, and the SDK prints a warning (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
-- `'closed'`: the SDK throws `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
+| Pre-flight answer | `failMode: 'open'` (default) | `failMode: 'closed'` |
+|---|---|---|
+| 2xx, `decision` `allow`, `warn` or `redact` | The provider is called. SignalVault stored the request with its decision; the response is recorded. | Same |
+| 2xx, `decision: "block"` | The provider is **not** called. `SignalVaultBlockedError`. | Same |
+| Any status whose body says `content_policy_violation` (as `error`, `error.code` or `error.type`), or any non-2xx body with `decision: "block"` | The provider is **not** called. `SignalVaultBlockedError`, with the violations and dashboard URL from the body when present. | Same |
+| `429` with `recorded: true` (rule-check rate limit, `scan_timeout`, `unscanned_content`, any other reason) | The provider is called. SignalVault already stored the request unchecked; the SDK sends no second record; the response is recorded. The warning names the reason. | `SignalVaultUnavailableError`; the provider is not called. |
+| Everything else: network error, timeout, 3xx, 400, 401, 402, 403, 404 and any other 4xx, 413, 422, `429` without `recorded: true` (trial limit, general rate limit), 5xx, a 2xx that is not valid JSON or has no valid `decision` | The provider is called, with a warning (at most once a minute per cause, whether or not `debug` is on). The SDK records the request itself: a fallback `ai.request` marked unchecked, with the status and reason. The response is recorded after it. | `SignalVaultUnavailableError`, with the HTTP `status` of an error answer; the provider is not called. |
+| The request cannot be serialized to JSON for the check (a circular or `BigInt` value in the messages, metadata or model) | The provider is called. Fallback record as above, without the messages and metadata; reason `unserializable`, status `null`. | `SignalVaultUnavailableError`; the provider is not called. |
+
+The fallback record has the request's `request_id`, and its payload carries `preflight_unavailable: true`, `fail_mode: 'open'`, `preflight_status` (the HTTP status, or `null` when there was none) and `preflight_reason`: `timeout`, `network`, `redirect`, `invalid_response` or `unserializable`, else SignalVault's error code, else `http_<status>`. It is queued before the provider call, so a provider call that throws or a stream you never read still leaves it, and it is retried on the background queue like other audit events (see [Delivery of Audit Events](#delivery-of-audit-events)). After a 400, 413, 422 or any other 4xx except 401, 402, 403 and 429, it leaves out the messages and metadata, which SignalVault refused. SignalVault refuses every event from a key it refuses: after a 401, 402 or 403 it refuses the record and the response too, which are not retried and are logged only with `debug: true`; after the trial limit the record is retried, then dropped and logged (see [What is logged when events are dropped](#what-is-logged-when-events-are-dropped)).
 
 `failMode` applies to the pre-flight check, so it has no effect in mirror mode.
 
-**Rate limits.** Rule checks — the pre-flight `ai.request` — are limited to 120 requests per minute per app. Over that limit, SignalVault still records the request in your audit log, marked as unchecked, but runs no rules on it, so there is no decision and `failMode` applies:
-
-- `'open'`: the request goes to the provider, the SDK warns that guardrails were not applied, and the response is recorded as usual, linked to the request. Tool calls are recorded as usual too.
-- `'closed'`: the SDK throws `SignalVaultUnavailableError` with `status` 429, and the provider is never called.
-
-The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Responses and tool calls do not use rule checks; mirror-mode requests do. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below). A pre-flight 429 for any other reason, such as the trial limit, is handled like the other refusals above, and no audit events are sent for that request.
+**Rate limits.** Rule checks — the pre-flight `ai.request` — are limited to 120 requests per minute per app. Over that limit, SignalVault stores the request unchecked, runs no rules on it and answers `429` with `recorded: true` (see the table). Tool calls are recorded as usual. The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Responses and tool calls do not use rule checks; mirror-mode requests do. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below).
 
 **Content the rules cannot read, and scans that do not finish.** When a rule that reads content is on (`contains_pii`, `contains_secret`, `keyword_blocklist`, `regex_match` or `prompt_injection`) and none of them has the action `block`, SignalVault records two more kinds of request unchecked and answers the same 429 with `recorded: true`, without `Retry-After`:
 
@@ -318,7 +321,7 @@ const client = new SignalVaultClient({
 
 ## Features
 
-- **Automatic Logging** — Every request and response is recorded in your SignalVault dashboard
+- **Automatic Logging** — Requests and responses are recorded in your SignalVault audit log, in the background
 - **Pre-flight Guardrails** — Block requests that break your rules before they reach the AI provider
 - **Redaction at rest** — Rules with the `redact` action remove matches from what SignalVault stores. The request sent to the AI provider is **not** modified.
 - **PII Detection** — Automatically detect emails, phone numbers, SSNs in prompts

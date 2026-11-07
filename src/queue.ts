@@ -53,6 +53,11 @@ export interface QueuedDelivery {
   firstAttempt: Promise<Delivery>;
   /** Settles once the event is delivered, rejected or dropped. */
   done: Promise<Delivery>;
+  /**
+   * Changes `lost` (see EventQueue.add()) for a drop that has not happened
+   * yet, e.g. back to 1 when the event that was to wait for it is not coming.
+   */
+  setLost(lost: number): void;
 }
 
 export interface QueueHooks {
@@ -129,13 +134,20 @@ export class EventQueue {
     let done!: (delivery: Delivery) => void;
     const firstAttempt = new Promise<Delivery>((resolve) => (first = resolve));
     const settled = new Promise<Delivery>((resolve) => (done = resolve));
-    this.insert({ seq: this.seq++, body, lost, attempts: 0, readyAt: 0, lastStatus: null, noRetry: false, first, done });
+    const entry: Entry = { seq: this.seq++, body, lost, attempts: 0, readyAt: 0, lastStatus: null, noRetry: false, first, done };
+    this.insert(entry);
     if (!this.busy) {
       this.busy = true;
       this.hooks.busy(true);
     }
     this.pump();
-    return { firstAttempt, done: settled };
+    return {
+      firstAttempt,
+      done: settled,
+      setLost: (n) => {
+        entry.lost = n;
+      },
+    };
   }
 
   /** Makes every waiting event due now, so flush() does not wait out a backoff. */

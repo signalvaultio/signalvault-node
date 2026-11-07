@@ -134,9 +134,11 @@ function describeError(error: unknown, secret: string): string {
 /**
  * What to do when SignalVault cannot return a guardrail decision (unreachable,
  * timed out, rate limited, invalid key, inactive subscription, content its
- * rules cannot read, ...).
+ * rules cannot read, ...). A refusal is not covered: a block always throws
+ * {@link SignalVaultBlockedError}.
  *
- * - `'open'` (default): allow the request and print a warning.
+ * - `'open'` (default): allow the request, print a warning, and record the
+ *   request marked unchecked when SignalVault has not stored it.
  * - `'closed'`: throw {@link SignalVaultUnavailableError} instead of calling
  *   the provider unchecked.
  */
@@ -257,20 +259,88 @@ export class SignalVaultUnavailableError extends Error {
 
 const ALLOW: SignalVaultDecision = { decision: 'allow', violations: [], redactions: [] };
 /**
- * Set on the decision returned when no pre-flight decision was obtained.
- * 'record': the server may not have stored the request (network, timeout,
- * 5xx, invalid response), so it is recorded in the background and the
- * unchecked call still appears in the audit log. 'recorded': the server
- * stored the request unchecked (429 with `recorded: true`: over the app's
- * rule-check rate limit, a rule scan that did not finish, or content the
- * rules cannot read), so the response is sent as usual. 'skip': the server
- * refused it (401/402/403/other 429/3xx), so a response event would be
- * refused too.
+ * Set on the decision returned in failMode 'open' when no pre-flight decision
+ * was obtained. 'recorded': the server stored the request unchecked (429 with
+ * `recorded: true`: over the app's rule-check rate limit, a rule scan that
+ * did not finish, or content the rules cannot read), so only the response is
+ * sent. Otherwise a PreflightFailure: the SDK records the request itself (see
+ * sendFallbackRequest).
  */
 const PREFLIGHT_FAILED = Symbol('preflightFailed');
-/** Causes where re-sending the ai.request later can succeed. */
-const RECORDABLE_CAUSES = new Set(['timeout', 'network', '5xx', 'invalid-response']);
 const DECISIONS = new Set(['allow', 'warn', 'block', 'redact']);
+/** What a server code must look like to be named in a warning or a record. */
+const CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const CONTENT_POLICY = 'content_policy_violation';
+
+/** Why a pre-flight got no decision, as the fallback ai.request reports it. */
+interface PreflightFailure {
+  /** `preflight_status`: the pre-flight's HTTP status; null when there was none. */
+  status: number | null;
+  /** `preflight_reason`: a code, never text from the server body. */
+  reason: string;
+  /**
+   * Leave out the messages and metadata: SignalVault refused the request as
+   * invalid or too large (400, 413, 422, any other 4xx) and would refuse the
+   * same content again, or it could not be serialized at all.
+   */
+  minimal: boolean;
+}
+
+/**
+ * The refusal in an answer that is not a decision: a body whose error is
+ * `content_policy_violation` (as `error`, `error.code` or `error.type`), at
+ * any status, or a non-2xx body with `decision: "block"`. Null otherwise.
+ * The events API answers a block as a 200 decision; `content_policy_violation`
+ * is the answer of the SignalVault proxy, matched here defensively so that a
+ * refusal is never handled as an outage.
+ */
+function refusal(status: number, body: any): SignalVaultDecision | null {
+  if (!body || typeof body !== 'object') return null;
+  const error = body.error !== null && typeof body.error === 'object' ? body.error : undefined;
+  const policy = body.error === CONTENT_POLICY || error?.code === CONTENT_POLICY || error?.type === CONTENT_POLICY;
+  const blocked = (status < 200 || status >= 300) && body.decision === 'block';
+  if (!policy && !blocked) return null;
+  const violations = Array.isArray(error?.violations)
+    ? error.violations
+    : Array.isArray(body.violations)
+      ? body.violations
+      : [];
+  const url = typeof error?.dashboard_url === 'string' ? error.dashboard_url : body.dashboard_url;
+  return {
+    decision: 'block',
+    violations: violations.filter((v: unknown) => v !== null && typeof v === 'object'),
+    redactions: [],
+    dashboard_url: typeof url === 'string' ? url : undefined,
+  };
+}
+
+/**
+ * `preflight_reason` for an HTTP answer without a decision: `redirect` for a
+ * 3xx; else the server's own code (`error` when it is a string, else
+ * `error.code`, else `error.type`) when it looks like a code; else
+ * `http_<status>`. Free text from the server never goes into the record.
+ */
+function failureReason(status: number, body: any): string {
+  if (status >= 300 && status < 400) return 'redirect';
+  const error = body?.error;
+  const code =
+    typeof error === 'string'
+      ? error
+      : error !== null && typeof error === 'object'
+        ? typeof error.code === 'string'
+          ? error.code
+          : error.type
+        : undefined;
+  return typeof code === 'string' && CODE.test(code) ? code : `http_${status}`;
+}
+
+/**
+ * A 4xx that says the request itself is invalid or too large. 401, 402 and
+ * 403 refuse the key, and 429 a rate or trial limit, not the content.
+ */
+function refusesContent(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 403 && status !== 429;
+}
 
 /**
  * Why SignalVault stored a pre-flight unchecked (429 with `recorded: true`),
@@ -295,7 +365,7 @@ function uncheckedReason(reason: unknown): [string, string] | null {
     ];
   }
   // A reason this version does not know: named when it looks like a code.
-  const code = typeof reason === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? `429: ${reason}` : '429';
+  const code = typeof reason === 'string' && CODE.test(reason) ? `429: ${reason}` : '429';
   return ['429-unchecked', `SignalVault recorded the request unchecked (${code})`];
 }
 
@@ -613,7 +683,7 @@ export class SignalVaultClient {
 
   /**
    * Queues a background event. `eventId: false` only for the fallback
-   * ai.request (see sendResponseEvent). `lost`: see EventQueue.add().
+   * ai.request (see sendFallbackRequest). `lost`: see EventQueue.add().
    */
   private enqueue(body: Record<string, unknown>, { eventId = true, lost = 1 } = {}): QueuedDelivery {
     return this.queue.add(eventId ? { event_id: randomUUID(), ...body } : body, lost);
@@ -968,10 +1038,10 @@ export class SignalVaultClient {
     const model = params.model as string;
     const messages = params.messages as unknown[];
     const decision = await this.enforce(requestId, model, messages, metadata, 'openai');
-    const fallback = this.fallbackRequest(decision, requestId, model, messages, metadata, 'openai');
+    const fallback = this.sendFallbackRequest(decision, requestId, model, messages, metadata, 'openai');
 
     const usage = withStreamUsage(params);
-    const response = await this.openai!.chat.completions.create(usage.params as any);
+    const response = await this.callProvider(fallback, () => this.openai!.chat.completions.create(usage.params as any));
 
     if (params.stream) {
       return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
@@ -1037,9 +1107,9 @@ export class SignalVaultClient {
   ) {
     const messages = anthropicMessagesForAudit(params);
     const decision = await this.enforce(requestId, params.model, messages, metadata, 'anthropic');
-    const fallback = this.fallbackRequest(decision, requestId, params.model, messages, metadata, 'anthropic');
+    const fallback = this.sendFallbackRequest(decision, requestId, params.model, messages, metadata, 'anthropic');
 
-    const response = await this.anthropic.messages.create(params);
+    const response = await this.callProvider<any>(fallback, () => this.anthropic.messages.create(params));
 
     if (params.stream) {
       return this.wrapAnthropicStream(response, (output, usage) =>
@@ -1144,17 +1214,18 @@ export class SignalVaultClient {
   }
 
   /**
-   * Called when no decision could be obtained. Throws in failMode 'closed';
-   * otherwise warns (never silently) and allows. `recorded`: the server
-   * stored the request without checking it. `warning`: the fail-open warning,
-   * when the default does not fit.
+   * Called when no decision could be obtained. Throws in failMode 'closed'
+   * (`status`: the error's status); otherwise warns (never silently) and
+   * allows. `failure`: 'recorded' when the server stored the request without
+   * checking it, otherwise what the SDK's own record of it reports.
+   * `warning`: the fail-open warning, when the default does not fit.
    */
   private unavailable(
     requestId: string,
     key: string,
     reason: string,
-    status?: number,
-    recorded = false,
+    status: number | undefined,
+    failure: PreflightFailure | 'recorded',
     warning?: string
   ): SignalVaultDecision {
     if (this.failMode === 'closed') {
@@ -1165,41 +1236,73 @@ export class SignalVaultClient {
       warning ??
         `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent ` +
           `to the provider unchecked (failMode: 'open').` +
-          (recorded ? ' They are still recorded in the audit log, marked as unchecked.' : '')
+          (failure === 'recorded' ? ' They are still recorded in the audit log, marked as unchecked.' : '')
     );
     const decision: SignalVaultDecision = { ...ALLOW, violations: [], redactions: [] };
-    (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED] = recorded
-      ? 'recorded'
-      : RECORDABLE_CAUSES.has(key)
-        ? 'record'
-        : 'skip';
+    (decision as unknown as Record<symbol, unknown>)[PREFLIGHT_FAILED] = failure;
     return decision;
   }
 
   /**
-   * The ai.request body to record in the background when the pre-flight got
-   * no decision, so an unchecked call is still in the audit log. Undefined
-   * when the server stored the pre-flight (with a decision, or unchecked: 429
-   * with `recorded: true`); null when the server refused it and no audit
-   * event should be sent.
+   * Records a request whose pre-flight got no decision, in failMode 'open',
+   * so the unchecked call is in the audit log: an ai.request marked
+   * `preflight_unavailable`, with the pre-flight's status and a reason code.
+   * Queued as soon as the decision to go ahead is made, before the provider
+   * call, so a call that throws or a stream that is never read still leaves
+   * it. Undefined when the server stored the request (with a decision, or
+   * unchecked: 429 with `recorded: true`).
+   *
+   * No event_id: the server de-duplicates it by request_id, which also covers
+   * a pre-flight it stored before the client gave up on it, and every retry.
+   * `lost: 2`: the response waits for it and is not sent without it (see
+   * callProvider for when no response comes).
    */
-  private fallbackRequest(
+  private sendFallbackRequest(
     decision: SignalVaultDecision,
     requestId: string,
-    model: string,
+    model: unknown,
     messages: unknown[],
     metadata: Record<string, unknown>,
     provider: string
-  ): Record<string, unknown> | null | undefined {
-    const failed = (decision as unknown as Record<symbol, string>)[PREFLIGHT_FAILED];
-    if (failed === undefined || failed === 'recorded') return undefined;
-    if (failed === 'skip') return null;
-    return {
-      ...this.requestBody(requestId, model, messages, metadata, provider),
-      // A fallback is only sent once the call has gone to the provider, so a
-      // request recorded unchecked from it was forwarded.
-      payload: { messages, preflight_unavailable: true, fail_mode: 'open' },
+  ): QueuedDelivery | undefined {
+    const failure = (decision as unknown as Record<symbol, unknown>)[PREFLIGHT_FAILED];
+    if (failure === undefined || failure === 'recorded') return undefined;
+    const { status, reason, minimal } = failure as PreflightFailure;
+    const payload: Record<string, unknown> = {
+      preflight_unavailable: true,
+      fail_mode: 'open',
+      preflight_status: status,
+      preflight_reason: reason,
     };
+    const body: Record<string, unknown> = {
+      type: 'ai.request',
+      request_id: requestId,
+      environment: this.svEnvironment,
+      provider,
+    };
+    if (minimal) {
+      // Content SignalVault refused, or could not serialize, would fail again.
+      if (typeof model === 'string') body.model = model;
+    } else {
+      body.model = model;
+      body.metadata = metadata;
+      payload.messages = messages;
+    }
+    body.payload = payload;
+    return this.enqueue(body, { eventId: false, lost: 2 });
+  }
+
+  /**
+   * Calls the provider. If the call throws, no response will wait for the
+   * fallback request, so a drop of it no longer counts one.
+   */
+  private async callProvider<T>(fallback: QueuedDelivery | undefined, call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (error) {
+      fallback?.setLost(1);
+      throw error;
+    }
   }
 
   private requestBody(
@@ -1257,14 +1360,17 @@ export class SignalVaultClient {
     };
   }
 
-  /** Single POST. Never follows redirects, so the API key is never re-sent elsewhere. */
-  private async post(body: Record<string, unknown>, timeoutMs: number): Promise<PostResult> {
+  /**
+   * Single POST of an event, or of one already serialized. Never follows
+   * redirects, so the API key is never re-sent elsewhere.
+   */
+  private async post(body: Record<string, unknown> | string, timeoutMs: number): Promise<PostResult> {
     const response = await fetch(`${this.svBaseUrl}/v1/events`, {
       method: 'POST',
       headers: this.headers(),
       redirect: 'manual',
       signal: AbortSignal.timeout(timeoutMs),
-      body: JSON.stringify(body),
+      body: typeof body === 'string' ? body : JSON.stringify(body),
     });
     return { ok: response.ok, status: response.status, response };
   }
@@ -1281,15 +1387,26 @@ export class SignalVaultClient {
     metadata: Record<string, unknown>,
     provider: string
   ): Promise<SignalVaultDecision> {
+    let json: string;
+    try {
+      json = JSON.stringify({
+        ...this.requestBody(requestId, model, messages, metadata, provider),
+        payload: { messages, fail_mode: this.failMode },
+      });
+    } catch (error) {
+      // A circular or BigInt value in the messages, the metadata or the model.
+      if (this.debugMode) {
+        console.error('[SignalVault] Pre-flight not sent:', describeError(error, this.svApiKey));
+      }
+      return this.unavailable(
+        requestId, 'unserializable', 'SignalVault could not serialize the request to JSON for the pre-flight check',
+        undefined, { status: null, reason: 'unserializable', minimal: true }
+      );
+    }
+
     let result: PostResult;
     try {
-      result = await this.post(
-        {
-          ...this.requestBody(requestId, model, messages, metadata, provider),
-          payload: { messages, fail_mode: this.failMode },
-        },
-        this.preflightTimeout
-      );
+      result = await this.post(json, this.preflightTimeout);
     } catch (error) {
       const timedOut = isTimeout(error);
       if (this.debugMode) {
@@ -1300,9 +1417,12 @@ export class SignalVaultClient {
         timedOut ? 'timeout' : 'network',
         timedOut
           ? `SignalVault pre-flight check timed out after ${this.preflightTimeout}ms`
-          : 'SignalVault API is unreachable'
+          : 'SignalVault API is unreachable',
+        undefined,
+        { status: null, reason: timedOut ? 'timeout' : 'network', minimal: false }
       );
     }
+    const { status } = result;
 
     if (!result.ok) {
       let body: any;
@@ -1311,7 +1431,9 @@ export class SignalVaultClient {
       } catch {
         body = undefined;
       }
-      if (result.status === 429 && body?.recorded === true) {
+      const refused = refusal(status, body);
+      if (refused) return refused;
+      if (status === 429 && body?.recorded === true) {
         // The server stored the request unchecked, but there is still no
         // decision: over the app's rule-check rate limit, or for a reason
         // that is not a limit and a retry would not change.
@@ -1319,17 +1441,21 @@ export class SignalVaultClient {
         if (unchecked) {
           const [key, reason] = unchecked;
           return this.unavailable(
-            requestId, key, reason, 429, true,
+            requestId, key, reason, 429, 'recorded',
             `[SignalVault] ${reason[0].toUpperCase()}${reason.slice(1)}. Guardrails were NOT applied — it is ` +
               `being sent to the provider (failMode: 'open').`
           );
         }
         return this.unavailable(
-          requestId, '429-recorded', 'SignalVault rule-check rate limit reached (429)', 429, true
+          requestId, '429-recorded', 'SignalVault rule-check rate limit reached (429)', 429, 'recorded'
         );
       }
-      const [key, reason] = this.describeFailure(result.status, body);
-      return this.unavailable(requestId, key, reason, result.status);
+      const [key, reason] = this.describeFailure(status, body);
+      return this.unavailable(requestId, key, reason, status, {
+        status,
+        reason: failureReason(status, body),
+        minimal: refusesContent(status),
+      });
     }
 
     let data: any;
@@ -1338,13 +1464,22 @@ export class SignalVaultClient {
     } catch (error) {
       if (isTimeout(error)) {
         return this.unavailable(
-          requestId, 'timeout', `SignalVault pre-flight check timed out after ${this.preflightTimeout}ms`
+          requestId, 'timeout', `SignalVault pre-flight check timed out after ${this.preflightTimeout}ms`,
+          undefined, { status, reason: 'timeout', minimal: false }
         );
       }
-      return this.unavailable(requestId, 'invalid-response', 'SignalVault returned an invalid response');
+      return this.unavailable(
+        requestId, 'invalid-response', 'SignalVault returned an invalid response',
+        undefined, { status, reason: 'invalid_response', minimal: false }
+      );
     }
+    const refused = refusal(status, data);
+    if (refused) return refused;
     if (!data || typeof data !== 'object' || !DECISIONS.has(data.decision)) {
-      return this.unavailable(requestId, 'invalid-response', 'SignalVault returned an invalid decision');
+      return this.unavailable(
+        requestId, 'invalid-response', 'SignalVault returned an invalid decision',
+        undefined, { status, reason: 'invalid_response', minimal: false }
+      );
     }
 
     return {
@@ -1364,15 +1499,12 @@ export class SignalVaultClient {
     usage: Usage,
     metadata: Record<string, unknown>,
     provider: string,
-    fallbackRequest?: Record<string, unknown> | null
+    fallback?: QueuedDelivery
   ): Promise<void> {
-    if (fallbackRequest === null) return;
-    if (fallbackRequest) {
-      // Must land before the response: the server rejects an ai.response whose
-      // ai.request it has not stored. No event_id: the server de-duplicates it
-      // by request_id, which also covers a pre-flight it stored before the
-      // client gave up on it, and every retry.
-      const request = await this.enqueue(fallbackRequest, { eventId: false, lost: 2 }).done;
+    if (fallback) {
+      // The fallback request must land first: the server rejects an
+      // ai.response whose ai.request it has not stored.
+      const request = await fallback.done;
       // The response is not sent without its request: the server would refuse it.
       if (request.state === 'dropped') return;
     }
