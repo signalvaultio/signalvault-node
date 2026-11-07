@@ -31,7 +31,8 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       # Staged publishing needs npm >= 11.15.0 (and Node >= 22.14).
-      - run: npm install -g npm@^11.15.0
+      # Pinned on purpose: this job holds the OIDC token. To bump, pick an npm 11.x published at least 14 days ago.
+      - run: npm install -g npm@11.21.1
 
       - name: Check tag matches package.json version
         run: |
