@@ -18,6 +18,7 @@ import {
   PostResult,
   QueuedDelivery,
 } from './queue';
+import { firstRefusal } from './refused';
 
 export type { ToolRecordOptions, ToolsAPI } from './tools';
 
@@ -315,13 +316,11 @@ function refusal(status: number, body: any): SignalVaultDecision | null {
 }
 
 /**
- * `preflight_reason` for an HTTP answer without a decision: `redirect` for a
- * 3xx; else the server's own code (`error` when it is a string, else
- * `error.code`, else `error.type`) when it looks like a code; else
- * `http_<status>`. Free text from the server never goes into the record.
+ * SignalVault's error code in a response body: `error` when it is a string,
+ * else `error.code`, else `error.type`, when it looks like a code. Undefined
+ * otherwise: free text from the server never goes into a message or a record.
  */
-function failureReason(status: number, body: any): string {
-  if (status >= 300 && status < 400) return 'redirect';
+function serverCode(body: any): string | undefined {
   const error = body?.error;
   const code =
     typeof error === 'string'
@@ -331,7 +330,48 @@ function failureReason(status: number, body: any): string {
           ? error.code
           : error.type
         : undefined;
-  return typeof code === 'string' && CODE.test(code) ? code : `http_${status}`;
+  return typeof code === 'string' && CODE.test(code) ? code : undefined;
+}
+
+/**
+ * `preflight_reason` for an HTTP answer without a decision: `redirect` for a
+ * 3xx; else the server's own code (see serverCode); else `http_<status>`.
+ */
+function failureReason(status: number, body: any): string {
+  if (status >= 300 && status < 400) return 'redirect';
+  return serverCode(body) ?? `http_${status}`;
+}
+
+/**
+ * What to check when SignalVault refuses an event for the key (401) or the
+ * account (402, 403). It refuses every event sent with that key.
+ */
+const KEY_REFUSALS: Record<number, string> = {
+  401: 'Check the API key at signalvault.io.',
+  402: 'Check the account at signalvault.io.',
+  403: "Check the key's environment and account at signalvault.io.",
+};
+
+/**
+ * Warns when SignalVault refuses a background event with 401, 402 or 403:
+ * once per process per status, whichever client sent it, debug or not. The
+ * warning names the status, SignalVault's error code when it looks like one,
+ * and what to check. Never throws.
+ */
+async function warnKeyRefusal(result: PostResult): Promise<void> {
+  const fix = KEY_REFUSALS[result.status];
+  if (fix === undefined || !firstRefusal(result.status)) return;
+  let body: unknown;
+  try {
+    body = await result.response?.json();
+  } catch {
+    body = undefined;
+  }
+  const code = serverCode(body);
+  console.warn(
+    `[SignalVault] SignalVault refused an audit event (${result.status}${code ? `: ${code}` : ''}): ` +
+      `requests are not being recorded. ${fix}`
+  );
 }
 
 /**
@@ -606,7 +646,11 @@ export class SignalVaultClient {
     this.defaultMetadata = config.metadata ?? {};
     this.exitFlushTimeout = config.exitFlushTimeout ?? 10_000;
     this.queue = new EventQueue({
-      send: (body) => this.post(body, this.bgTimeout),
+      send: async (body) => {
+        const result = await this.post(body, this.bgTimeout);
+        await warnKeyRefusal(result);
+        return result;
+      },
       dropped: (reason, entries) => this.reportDropped(reason, entries),
       busy: (busy) => this.onQueueBusy(busy),
       debug: (message, detail) => {
@@ -912,10 +956,17 @@ export class SignalVaultClient {
 
     const delivery = this.enqueue(body);
     const result = await (waitForDelivery ? delivery.done : delivery.firstAttempt);
-    if (result.state === 'rejected' && result.status !== null && result.status >= 400 && result.status < 500) {
+    if (
+      result.state === 'rejected' &&
+      result.status !== null &&
+      result.status >= 400 &&
+      result.status < 500 &&
+      !(result.status in KEY_REFUSALS)
+    ) {
       // Surface 4xx unconditionally — those are usually misconfigurations
-      // (bad key, malformed payload) the user must know about. 429 is retried,
-      // so it is never 'rejected'.
+      // (a malformed payload) the user must know about. 429 is retried, so it
+      // is never 'rejected'; 401, 402 and 403 warn once per process instead
+      // (see warnKeyRefusal).
       console.warn(
         `[SignalVault] tool_call rejected with ${result.status}. ` +
           `Check your apiKey and event payload.`
