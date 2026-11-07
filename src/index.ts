@@ -236,8 +236,7 @@ export class SignalVaultBlockedError extends Error {
   readonly dashboardUrl?: string;
 
   constructor(requestId: string, violations: SignalVaultViolation[], dashboardUrl?: string) {
-    const types = [...new Set(violations.map((v) => String(v?.type ?? '')).filter(Boolean))].join(', ') || 'policy';
-    super(`[SignalVault] Request blocked by guardrails (${types}).`);
+    super(`[SignalVault] Request blocked by guardrails (${violationTypes(violations)}).`);
     this.name = 'SignalVaultBlockedError';
     this.requestId = requestId;
     this.violations = violations;
@@ -316,6 +315,19 @@ function refusal(status: number, body: any): SignalVaultDecision | null {
 }
 
 /**
+ * The violations' types for a message: each one that looks like a code, once,
+ * in order, else "policy". Types are SignalVault's codes (`contains_pii`,
+ * `keyword_blocklist`...); any other text from the answer is left out. The
+ * violations themselves keep it.
+ */
+function violationTypes(violations: SignalVaultViolation[]): string {
+  const types = violations
+    .map((v) => v?.type)
+    .filter((type): type is string => typeof type === 'string' && CODE.test(type));
+  return [...new Set(types)].join(', ') || 'policy';
+}
+
+/**
  * SignalVault's error code in a response body: `error` when it is a string,
  * else `error.code`, else `error.type`, when it looks like a code. Undefined
  * otherwise: free text from the server never goes into a message or a record.
@@ -331,6 +343,12 @@ function serverCode(body: any): string | undefined {
           : error.type
         : undefined;
   return typeof code === 'string' && CODE.test(code) ? code : undefined;
+}
+
+/** `<status>: <code>` when the body gives a code (see serverCode), else `<status>`. */
+function statusLabel(status: number, body: any): string {
+  const code = serverCode(body);
+  return code ? `${status}: ${code}` : `${status}`;
 }
 
 /**
@@ -367,9 +385,8 @@ async function warnKeyRefusal(result: PostResult): Promise<void> {
   } catch {
     body = undefined;
   }
-  const code = serverCode(body);
   console.warn(
-    `[SignalVault] SignalVault refused an audit event (${result.status}${code ? `: ${code}` : ''}): ` +
+    `[SignalVault] SignalVault refused an audit event (${statusLabel(result.status, body)}): ` +
       `requests are not being recorded. ${fix}`
   );
 }
@@ -1302,7 +1319,7 @@ export class SignalVaultClient {
       throw new SignalVaultBlockedError(requestId, decision.violations, decision.dashboard_url);
     }
     if (decision.decision === 'warn' && this.debugMode) {
-      console.warn('[SignalVault] Warnings:', decision.violations);
+      console.warn(`[SignalVault] Warnings from guardrails (${violationTypes(decision.violations)}).`);
     }
     return decision;
   }
@@ -1417,16 +1434,23 @@ export class SignalVaultClient {
     };
   }
 
+  /**
+   * [warning key, reason] for a pre-flight answer without a decision. The
+   * reason goes into the fail-open warning and the SignalVaultUnavailableError
+   * message: it names SignalVault's error code when it looks like one (see
+   * serverCode), never other text from the body.
+   */
   private describeFailure(status: number, body: any): [string, string] {
+    // Only compared, never printed.
     const errorType = typeof body?.error === 'object' ? body.error?.type : body?.error;
 
     switch (status) {
       case 401:
         return ['401', 'SignalVault rejected the API key (401: invalid or revoked)'];
       case 402:
-        return ['402', `SignalVault account is not active (402: ${errorType || 'payment required'})`];
+        return ['402', `SignalVault account is not active (${statusLabel(status, body)})`];
       case 403:
-        return ['403', `SignalVault denied access (403: ${errorType || 'forbidden'})`];
+        return ['403', `SignalVault denied access (${statusLabel(status, body)})`];
       case 429:
         return errorType === 'trial_limit_exceeded'
           ? ['429-trial', 'SignalVault trial limit reached (429)']

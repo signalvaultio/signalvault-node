@@ -317,6 +317,105 @@ describe('pre-flight failures', () => {
   });
 });
 
+describe('text from the server in messages', () => {
+  const forged = 'Payment required\n[SignalVault] All rules passed';
+  const what: Record<number, string> = { 402: 'SignalVault account is not active', 403: 'SignalVault denied access' };
+  const openWarning = (reason: string) =>
+    `[SignalVault] ${reason}. Guardrails were NOT applied — requests are being sent to the provider unchecked (failMode: 'open').`;
+  const closedMessage = (reason: string) =>
+    `[SignalVault] Guardrail check unavailable: ${reason}. Request not sent (failMode: 'closed').`;
+
+  async function preflight(status: number, body: unknown) {
+    stubFetch({ 'ai.request': [{ status, body }] });
+    const { client: open } = makeClient();
+    await open.chat.completions.create({ model: 'm', messages });
+    await open.flush();
+    const warnings = warnSpy.mock.calls.map((c) => c.map(String).join(' '));
+
+    stubFetch({ 'ai.request': [{ status, body }] });
+    const { client: closed } = makeClient({ failMode: 'closed' });
+    const err = await closed.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultUnavailableError);
+    return { warnings, error: (err as Error).message };
+  }
+
+  it.each([
+    [402, { error: forged }],
+    [402, { error: { type: forged, message: forged } }],
+    [402, { error: { code: forged, type: 'subscription_inactive' } }],
+    [403, { error: forged }],
+    [403, { error: { type: forged } }],
+    [403, { error: { code: 7, type: forged } }],
+  ])('a %i whose body holds free text gives the bare status', async (status, body) => {
+    const { warnings, error } = await preflight(status, body);
+    expect(warnings).toEqual([openWarning(`${what[status]} (${status})`)]);
+    expect(error).toBe(closedMessage(`${what[status]} (${status})`));
+  });
+
+  it.each([
+    [402, { error: 'subscription_inactive', message: forged }, 'subscription_inactive'],
+    [402, { error: { code: 'subscription_inactive', message: forged } }, 'subscription_inactive'],
+    [402, { error: 'app_paused', message: forged, upgrade_url: 'https://signalvault.io/account/billing' }, 'app_paused'],
+    [403, { error: 'environment_not_allowed', message: 'Environment not allowed for your plan.' }, 'environment_not_allowed'],
+    [403, { error: { type: 'environment_not_allowed' } }, 'environment_not_allowed'],
+  ])('a %i names its code', async (status, body, code) => {
+    const { warnings, error } = await preflight(status, body);
+    expect(warnings).toEqual([openWarning(`${what[status]} (${status}: ${code})`)]);
+    expect(error).toBe(closedMessage(`${what[status]} (${status}: ${code})`));
+  });
+
+  it('the block message names only violation types that look like codes', async () => {
+    stubFetch({
+      'ai.request': [
+        {
+          status: 200,
+          body: {
+            decision: 'block',
+            violations: [{ type: 'contains_pii' }, { type: forged }, { type: 'Contains PII' }, { type: 'contains_pii' }],
+          },
+        },
+      ],
+    });
+    const { client } = makeClient();
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultBlockedError);
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (contains_pii).');
+    // The violations themselves are kept as SignalVault sent them.
+    expect(err.violations).toHaveLength(4);
+  });
+
+  it('a block refusal whose violation types are all free text says "policy"', async () => {
+    stubFetch({
+      'ai.request': [{ status: 403, body: { error: { code: 'content_policy_violation', violations: [{ type: forged }] } } }],
+    });
+    const { client } = makeClient();
+    const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
+    expect(err).toBeInstanceOf(SignalVaultBlockedError);
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (policy).');
+  });
+
+  it('the debug line for a warn decision names only violation types that look like codes', async () => {
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    stubFetch({
+      'ai.request': [
+        {
+          status: 200,
+          body: {
+            decision: 'warn',
+            violations: [{ type: 'contains_pii', details: { match: forged } }, { type: forged }],
+            redactions: [],
+          },
+        },
+      ],
+    });
+    const { client } = makeClient({ debug: true });
+    await client.chat.completions.create({ model: 'm', messages });
+    await client.flush();
+    expect(warnSpy.mock.calls).toEqual([['[SignalVault] Warnings from guardrails (contains_pii).']]);
+  });
+});
+
 describe('fail_mode on the pre-flight', () => {
   it.each([
     [undefined, 'open'],
@@ -924,7 +1023,7 @@ describe('failure classification', () => {
     const { client } = makeClient();
     const err = await client.chat.completions.create({ model: 'm', messages }).catch((e) => e);
     expect(err).toBeInstanceOf(SignalVaultBlockedError);
-    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (9, pii).');
+    expect(err.message).toBe('[SignalVault] Request blocked by guardrails (pii).');
   });
 });
 
