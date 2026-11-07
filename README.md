@@ -209,6 +209,8 @@ The fallback record has the request's `request_id`, and its payload carries `pre
 
 The refused events are not retried. Other refusals of a background event (a 3xx, 400, 413, 422 or another 4xx) are logged only with `debug: true`, except a tool call's, which warns each time.
 
+**No text from SignalVault's answer in messages.** A warning, an error message or a log line names SignalVault's error code (the answer's `error` when it is a string, else `error.code`, else `error.type`) only when it looks like a code: a lowercase letter, then up to 63 lowercase letters, digits or underscores. For example `SignalVault account is not active (402: subscription_inactive)` or `SignalVault denied access (403: environment_not_allowed)`; otherwise the bare status, such as `(402)`. The message of `SignalVaultBlockedError`, and the `debug` line for a `warn` decision, name only the violation types that look like codes, else `policy`; the error's `violations` keep what SignalVault sent. No other text from an answer appears in a message.
+
 `failMode` applies to the pre-flight check, so it has no effect in mirror mode.
 
 **Rate limits.** Rule checks — the pre-flight `ai.request` — are limited to 120 requests per minute per app. Over that limit, SignalVault stores the request unchecked, runs no rules on it and answers `429` with `recorded: true` (see the table). Tool calls are recorded as usual. The SDK sends its `failMode` with each pre-flight check (`payload.fail_mode`), so SignalVault records whether an unchecked request was sent to the provider. If every request must be checked, use `failMode: 'closed'`: requests over the limit are then refused instead of sent unchecked. Responses and tool calls do not use rule checks; mirror-mode requests do. Every event type shares one ceiling of 3,000 events per minute per app, and audit events are retried when it is reached (see below).
@@ -370,7 +372,7 @@ When a guardrail rule blocks a request, `create()` throws `SignalVaultBlockedErr
 - `requestId` — the ID the SDK sent to SignalVault as `request_id` for this request
 - `dashboardUrl` — a link to the blocked request, when the API provides one
 
-The message lists only the violation types, never the matched content.
+The message lists only the violation types, never the matched content or other text from SignalVault's answer.
 
 A request carrying content the rules cannot read, under a `block` rule that reads content, is blocked with a violation of type `unscanned_content_guard`; its `details` hold a `description` and `content_types`, naming each type (SignalVault 0.18.9 and later). One whose rule scan did not finish is blocked with `scan_timeout_guard`.
 

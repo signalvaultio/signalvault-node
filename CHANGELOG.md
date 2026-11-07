@@ -7,6 +7,7 @@ A refusal from SignalVault stops the request in both fail modes, and with `failM
 ### Security
 
 - **`util.inspect(client)` and `console.log(client)` show no API keys.** The SignalVault key is kept in an ES private field, and the client prints without its `openai` and `anthropic` provider clients, which hold the provider keys. `JSON.stringify(client)` behaves as before.
+- **No text from SignalVault's answer reaches a message.** The pre-flight warning and the `SignalVaultUnavailableError` message for a 402 or a 403 name SignalVault's error code only when it looks like a code (`^[a-z][a-z0-9_]{0,63}$`, from `error`, else `error.code`, else `error.type`), for example "SignalVault account is not active (402: subscription_inactive)", and otherwise give the bare status: "(402)". The message of `SignalVaultBlockedError` names only the violation types that look like codes, else "policy"; its `violations` are unchanged. With `debug: true`, a `warn` decision prints "[SignalVault] Warnings from guardrails (contains_pii)." with the types only, no longer the violation objects, whose `details` come from the answer. A 402 or 403 that gives its code as `error.code` is named by it, where it read "payment required" or "forbidden".
 
 ### Changes
 
