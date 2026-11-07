@@ -573,6 +573,8 @@ export class SignalVaultClient {
   private readonly exitFlushTimeout: number;
   private readonly queue: EventQueue;
   private readonly dropped: DroppedEvents = { queueFull: 0, retriesExhausted: 0, exit: 0 };
+  /** Records the response of a stream dropped before it finished; see recordStream. */
+  private readonly abandonedStreams = new FinalizationRegistry<(abandoned: boolean) => void>((record) => record(true));
   private exitFlushing = false;
 
   /**
@@ -1018,10 +1020,10 @@ export class SignalVaultClient {
     const messages = params.messages as unknown[];
 
     if (params.stream) {
-      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
+      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens, abandoned) =>
         this.sendAuditEvents(
           requestId, model, messages, output,
-          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai'
+          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai', abandoned
         )
       );
     }
@@ -1059,10 +1061,10 @@ export class SignalVaultClient {
     const response = await this.callProvider(fallback, () => this.openai!.chat.completions.create(usage.params as any));
 
     if (params.stream) {
-      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens) =>
+      return this.wrapStream(response as any, usage.injected, (output, promptTokens, completionTokens, abandoned) =>
         this.sendResponseEvent(
           requestId, model, output,
-          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai', fallback
+          { prompt_tokens: promptTokens, completion_tokens: completionTokens }, metadata, 'openai', fallback, abandoned
         )
       );
     }
@@ -1096,8 +1098,8 @@ export class SignalVaultClient {
     const messages = anthropicMessagesForAudit(params);
 
     if (params.stream) {
-      return this.wrapAnthropicStream(response, (output, usage) =>
-        this.sendAuditEvents(requestId, params.model, messages, output, usage, metadata, 'anthropic')
+      return this.wrapAnthropicStream(response, (output, usage, abandoned) =>
+        this.sendAuditEvents(requestId, params.model, messages, output, usage, metadata, 'anthropic', abandoned)
       );
     }
 
@@ -1127,8 +1129,8 @@ export class SignalVaultClient {
     const response = await this.callProvider<any>(fallback, () => this.anthropic.messages.create(params));
 
     if (params.stream) {
-      return this.wrapAnthropicStream(response, (output, usage) =>
-        this.sendResponseEvent(requestId, params.model, output, usage, metadata, 'anthropic', fallback)
+      return this.wrapAnthropicStream(response, (output, usage, abandoned) =>
+        this.sendResponseEvent(requestId, params.model, output, usage, metadata, 'anthropic', fallback, abandoned)
       );
     }
 
@@ -1149,60 +1151,86 @@ export class SignalVaultClient {
   /**
    * Yields chunks through unchanged and records the response when the stream
    * ends — including when the consumer breaks out early or the stream throws,
-   * in which case the partial output is recorded. When the SDK added
+   * in which case the partial output is recorded, and when the stream is
+   * dropped before that (see recordStream). When the SDK added
    * `include_usage` itself (`hideUsageChunk`), the usage-only final chunk is
    * consumed here rather than passed on.
    */
-  private async *wrapStream(
+  private wrapStream(
     stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>,
     hideUsageChunk: boolean,
-    onComplete: (output: string, promptTokens: number, completionTokens: number) => Promise<void>
-  ) {
+    onComplete: (output: string, promptTokens: number, completionTokens: number, abandoned: boolean) => Promise<void>
+  ): AsyncGenerator<OpenAI.Chat.Completions.ChatCompletionChunk> {
     const chunks: string[] = [];
     let promptTokens = 0;
     let completionTokens = 0;
 
-    try {
-      for await (const chunk of stream) {
-        const content = chunk.choices?.[0]?.delta?.content || '';
-        if (content) chunks.push(content);
-        if (chunk.usage) {
-          promptTokens = chunk.usage.prompt_tokens || 0;
-          completionTokens = chunk.usage.completion_tokens || 0;
-          // Missing or empty `choices`: the usage-only chunk the caller didn't ask for.
-          if (hideUsageChunk && !chunk.choices?.length) continue;
+    return this.recordStream(
+      (async function* () {
+        for await (const chunk of stream) {
+          const content = chunk.choices?.[0]?.delta?.content || '';
+          if (content) chunks.push(content);
+          if (chunk.usage) {
+            promptTokens = chunk.usage.prompt_tokens || 0;
+            completionTokens = chunk.usage.completion_tokens || 0;
+            // Missing or empty `choices`: the usage-only chunk the caller didn't ask for.
+            if (hideUsageChunk && !chunk.choices?.length) continue;
+          }
+          yield chunk;
         }
-        yield chunk;
-      }
-    } finally {
-      this.track(onComplete(chunks.join(''), promptTokens, completionTokens));
-    }
+      })(),
+      (abandoned) => this.track(onComplete(chunks.join(''), promptTokens, completionTokens, abandoned))
+    );
   }
 
-  private async *wrapAnthropicStream(
+  private wrapAnthropicStream(
     stream: AsyncIterable<any>,
-    onComplete: (output: string, usage: Usage) => Promise<void>
-  ) {
+    onComplete: (output: string, usage: Usage, abandoned: boolean) => Promise<void>
+  ): AsyncGenerator<any> {
     const chunks: string[] = [];
     let usage = anthropicUsage();
 
-    try {
-      for await (const event of stream) {
-        if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-          chunks.push(event.delta.text || '');
+    return this.recordStream(
+      (async function* () {
+        for await (const event of stream) {
+          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            chunks.push(event.delta.text || '');
+          }
+          // message_delta may repeat the input and cache counts; its values win.
+          if (event.type === 'message_start' && event.message?.usage) {
+            usage = anthropicUsage(usage, event.message.usage);
+          }
+          if (event.type === 'message_delta' && event.usage) {
+            usage = anthropicUsage(usage, event.usage);
+          }
+          yield event;
         }
-        // message_delta may repeat the input and cache counts; its values win.
-        if (event.type === 'message_start' && event.message?.usage) {
-          usage = anthropicUsage(usage, event.message.usage);
-        }
-        if (event.type === 'message_delta' && event.usage) {
-          usage = anthropicUsage(usage, event.usage);
-        }
-        yield event;
+      })(),
+      (abandoned) => this.track(onComplete(chunks.join(''), usage, abandoned))
+    );
+  }
+
+  /**
+   * Returns `inner` wrapped so that `record` runs once: from the `finally`
+   * when the stream ends, the consumer breaks out or it throws; or, for a
+   * stream dropped before any of that (never iterated, or abandoned without
+   * break/return), when the wrapper is garbage collected, with `abandoned`
+   * true. Garbage collection may come late, or not before the process exits.
+   */
+  private recordStream<T>(inner: AsyncGenerator<T>, record: (abandoned: boolean) => void): AsyncGenerator<T> {
+    const registry = this.abandonedStreams;
+    const token = {};
+    const outer = (async function* () {
+      try {
+        yield* inner;
+      } finally {
+        registry.unregister(token);
+        record(false);
       }
-    } finally {
-      this.track(onComplete(chunks.join(''), usage));
-    }
+    })();
+    // `record` must not reach `outer`, or `outer` would never be collected.
+    registry.register(outer, record, token);
+    return outer;
   }
 
   // ---------------------------------------------------------------------------
@@ -1514,7 +1542,8 @@ export class SignalVaultClient {
     usage: Usage,
     metadata: Record<string, unknown>,
     provider: string,
-    fallback?: QueuedDelivery
+    fallback?: QueuedDelivery,
+    abandoned = false
   ): Promise<void> {
     if (fallback) {
       // The fallback request must land first: the server rejects an
@@ -1530,10 +1559,8 @@ export class SignalVaultClient {
       provider,
       model,
       metadata,
-      payload: {
-        output,
-        usage,
-      },
+      // `stream_abandoned`: recorded when the stream was garbage collected (recordStream).
+      payload: abandoned ? { output, usage, stream_abandoned: true } : { output, usage },
     }).done;
   }
 
@@ -1550,7 +1577,8 @@ export class SignalVaultClient {
     output: string,
     usage: Usage,
     metadata: Record<string, unknown>,
-    provider: string
+    provider: string,
+    abandoned = false
   ): Promise<void> {
     const base = {
       request_id: requestId,
@@ -1569,11 +1597,9 @@ export class SignalVaultClient {
     await this.enqueue({
       ...base,
       type: 'ai.response',
-      payload: {
-        output,
-        usage,
-        monitor_mode: true,
-      },
+      payload: abandoned
+        ? { output, usage, monitor_mode: true, stream_abandoned: true }
+        : { output, usage, monitor_mode: true },
     }).done;
   }
 }

@@ -72,7 +72,7 @@ console.log(response.content[0].text);
 
 ## Streaming
 
-Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early or the stream fails. A stream you never iterate has no response in the log (in mirror mode, no request either).
+Streaming is fully supported for both providers. SignalVault logs the response when the stream ends — including a partial response if you stop iterating early or the stream fails. A stream you drop without finishing it or breaking out of it (never iterated, or abandoned part-way) is logged when it is garbage collected, with the output read so far and `stream_abandoned: true` in the response payload. That can come late, or not at all if the process exits first, and `flush()` does not wait for it.
 
 ```typescript
 // OpenAI streaming
