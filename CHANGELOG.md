@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.1 — unreleased
+## 0.6.1 — 2026-11-12
 
 A refusal from SignalVault stops the request in both fail modes, and with `failMode: 'open'` the SDK sends its own record of every request SignalVault did not store, before the provider call.
 
